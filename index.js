@@ -87,6 +87,31 @@ const io = new Server(server, {
   maxHttpBufferSize: 1e6
 });
 
+// If REDIS_URL is provided we will connect a Redis adapter so Socket.IO
+// can share session state across multiple instances (necessary on Render
+// when scaling to more than one instance). If not set, the server runs
+// without an adapter (single-instance mode).
+if (process.env.REDIS_URL) {
+  try {
+    const { createAdapter } = require('@socket.io/redis-adapter');
+    const { createClient } = require('redis');
+
+    const pubClient = createClient({ url: process.env.REDIS_URL });
+    const subClient = pubClient.duplicate();
+
+    (async () => {
+      await pubClient.connect();
+      await subClient.connect();
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log('[BOOT] Redis adapter connected for Socket.IO');
+    })().catch((err) => {
+      console.error('[BOOT] Redis adapter connection failed:', err);
+    });
+  } catch (err) {
+    console.warn('[BOOT] Redis adapter not available:', err.message);
+  }
+}
+
 // Render/Railway/etc. provide PORT automatically.
 const PORT = Number(process.env.PORT) || 3000;
 
