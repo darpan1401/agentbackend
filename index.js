@@ -44,16 +44,30 @@ const { Server } = require("socket.io");
 
 const app = express();
 
+// When running behind Render/nginx/other proxies, trust proxy headers
+app.set('trust proxy', true);
+
 app.disable("x-powered-by");
 
 const server = http.createServer(app);
 
+// Configure Socket.IO to be proxy-friendly and prefer polling first for
+// environments where websocket upgrades may be restricted. Tweak timeouts
+// to be reasonable for free-tier hosts.
 const io = new Server(server, {
+  path: '/socket.io',
   cors: {
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"]
   },
-  transports: ["websocket", "polling"]
+  // Use polling first so clients behind restrictive proxies can connect.
+  transports: ["polling", "websocket"],
+  allowEIO3: false,
+  // Ping/pong intervals (ms)
+  pingInterval: 25000,
+  pingTimeout: 60000,
+  // Small buffer size to limit memory usage of large messages
+  maxHttpBufferSize: 1e6
 });
 
 // Render/Railway/etc. provide PORT automatically.
