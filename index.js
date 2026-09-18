@@ -51,6 +51,23 @@ app.disable("x-powered-by");
 
 const server = http.createServer(app);
 
+// Log raw incoming HTTP requests to /socket.io so hosting logs capture handshake
+server.on('request', (req, res) => {
+  try {
+    if (req.url && req.url.indexOf('/socket.io') === 0) {
+      console.log('');
+      console.log('--- RAW SOCKET.IO REQUEST ---');
+      console.log('[HTTP] Method:', req.method);
+      console.log('[HTTP] URL:', req.url);
+      console.log('[HTTP] Headers:', req.headers);
+      console.log('-----------------------------');
+      console.log('');
+    }
+  } catch (err) {
+    console.warn('Failed to log raw socket.io request', err);
+  }
+});
+
 // Configure Socket.IO to be proxy-friendly and prefer polling first for
 // environments where websocket upgrades may be restricted. Tweak timeouts
 // to be reasonable for free-tier hosts.
