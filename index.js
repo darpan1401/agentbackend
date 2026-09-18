@@ -1,35 +1,135 @@
-// ============================================================
-// Alexa <-> Device Bridge Server
-// ============================================================
-// Handles:
-// 1) Device connections via Socket.io
-// 2) Commands coming from Alexa Skill
-// 3) Forwards commands to connected devices
-// 4) Relays device responses back to Alexa
-//
-// HOSTING:
-// - Local Node.js server
-// - Cloudflare Tunnel
-//
-// NO GoDaddy dependency
-// ============================================================
-
 "use strict";
+
+/*
+============================================================
+ ALEXA DEVICE BRIDGE - UNIVERSAL SERVER
+============================================================
+
+Works with:
+  - Render
+  - Railway
+  - Any Node.js server
+  - Local Node.js
+  - ngrok
+  - Cloudflare Tunnel
+  - Other HTTPS reverse proxies
+
+Main endpoints:
+  GET  /
+  GET  /health
+  GET  /status
+  GET  /alexa-webhook
+  POST /alexa-webhook
+  POST /alexa-command
+
+Socket.IO:
+  connection
+  register
+  command_result
+  ping
+
+============================================================
+*/
 
 const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
-const crypto = require("crypto");
 const https = require("https");
+const crypto = require("crypto");
+const cors = require("cors");
+const { Server } = require("socket.io");
 
 // ============================================================
-// APP SETUP
+// CONFIG
 // ============================================================
 
 const app = express();
 
 app.disable("x-powered-by");
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"]
+  },
+  transports: ["websocket", "polling"]
+});
+
+// Render/Railway/etc. provide PORT automatically.
+const PORT = Number(process.env.PORT) || 3000;
+
+// MUST be 0.0.0.0 for Render/cloud hosting.
+const HOST = "0.0.0.0";
+
+// Secret used by your device/app.
+const SHARED_SECRET =
+  process.env.BRIDGE_SECRET || "change-this-secret-123";
+
+// Alexa allows maximum timestamp tolerance.
+const ALEXA_TIMESTAMP_TOLERANCE_MS = 150 * 1000;
+
+// ============================================================
+// MEMORY
+// ============================================================
+
+const connectedDevices = new Map();
+const pendingCommands = new Map();
+
+// ============================================================
+// DEBUG HELPERS
+// ============================================================
+
+function now() {
+  return new Date().toISOString();
+}
+
+function separator() {
+  console.log(
+    "============================================================"
+  );
+}
+
+function debug(title, data = null) {
+  console.log(`[${now()}] [DEBUG] ${title}`);
+
+  if (data !== null) {
+    console.dir(data, {
+      depth: 10,
+      colors: false
+    });
+  }
+}
+
+function info(title, data = null) {
+  console.log(`[${now()}] [INFO] ${title}`);
+
+  if (data !== null) {
+    console.dir(data, {
+      depth: 10,
+      colors: false
+    });
+  }
+}
+
+function warn(title, data = null) {
+  console.warn(`[${now()}] [WARN] ${title}`);
+
+  if (data !== null) {
+    console.dir(data, {
+      depth: 10,
+      colors: false
+    });
+  }
+}
+
+function errorLog(title, error = null) {
+  console.error(`[${now()}] [ERROR] ${title}`);
+
+  if (error) {
+    console.error(error);
+  }
+}
 
 // ============================================================
 // CORS
@@ -44,27 +144,24 @@ app.use(
       "Authorization",
       "SignatureCertChainUrl",
       "Signature-256",
-      "Signature",
-    ],
+      "Signature"
+    ]
   })
 );
 
 // ============================================================
-// JSON BODY PARSER
-// ============================================================
-//
-// Keep the exact raw request body because Alexa signs the
-// original request body.
-//
+// JSON BODY
 // ============================================================
 
+// IMPORTANT:
+// Alexa signature verification needs the original raw body.
 app.use(
   express.json({
     limit: "1mb",
 
     verify: (req, res, buf) => {
       req.rawBody = Buffer.from(buf);
-    },
+    }
   })
 );
 
@@ -73,145 +170,170 @@ app.use(
 // ============================================================
 
 app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  const start = Date.now();
+
+  req.requestId = requestId;
+
+  console.log("");
+  separator();
+
   console.log(
-    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`
+    `[HTTP] ${req.method} ${req.originalUrl}`
   );
+
+  console.log(
+    `[HTTP] Request ID: ${requestId}`
+  );
+
+  console.log(
+    `[HTTP] User-Agent: ${req.get("user-agent") || "N/A"}`
+  );
+
+  console.log(
+    `[HTTP] Content-Type: ${req.get("content-type") || "N/A"}`
+  );
+
+  console.log(
+    `[HTTP] Content-Length: ${req.get("content-length") || "N/A"}`
+  );
+
+  if (req.headers["signaturecertchainurl"]) {
+    console.log(
+      "[HTTP] Alexa SignatureCertChainUrl: PRESENT"
+    );
+  }
+
+  if (req.headers["signature-256"]) {
+    console.log(
+      "[HTTP] Alexa Signature-256: PRESENT"
+    );
+  }
+
+  res.on("finish", () => {
+    console.log(
+      `[HTTP] Response ${res.statusCode} (${Date.now() - start}ms)`
+    );
+
+    separator();
+    console.log("");
+  });
 
   next();
 });
 
 // ============================================================
-// HTTP SERVER
+// ROOT
 // ============================================================
-
-const server = http.createServer(app);
-
-// ============================================================
-// SOCKET.IO
-// ============================================================
-
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
-
-  transports: ["websocket", "polling"],
-});
-
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-const PORT =
-  Number(process.env.PORT) || 3000;
-
-const HOST = "0.0.0.0";
-
-// ------------------------------------------------------------
-// Device authentication secret
-// ------------------------------------------------------------
-
-const SHARED_SECRET =
-  process.env.BRIDGE_SECRET ||
-  "change-this-secret-123";
-
-// ------------------------------------------------------------
-// Alexa timestamp tolerance
-// ------------------------------------------------------------
-//
-// Amazon recommends a maximum tolerance of 150 seconds.
-// ------------------------------------------------------------
-
-const ALEXA_TIMESTAMP_TOLERANCE_MS =
-  150 * 1000;
-
-// ============================================================
-// IN-MEMORY STATE
-// ============================================================
-
-const connectedDevices = new Map();
-
-const pendingCommands = new Map();
-
-// ============================================================
-// BASIC ROUTES
-// ============================================================
-
-// ------------------------------------------------------------
-// Root
-// ------------------------------------------------------------
 
 app.get("/", (req, res) => {
+  info("Root endpoint requested");
+
   res.status(200).json({
-    name: "Alexa Device Bridge",
+    service: "Alexa Device Bridge",
     status: "online",
-    environment: "local",
-    cloudflareReady: true,
-    message:
-      "Alexa Device Bridge is running.",
-    timestamp:
-      new Date().toISOString(),
+
+    server: {
+      node: process.version,
+      environment: process.env.NODE_ENV || "development",
+      port: PORT,
+      host: HOST
+    },
+
+    endpoints: {
+      health: "/health",
+      status: "/status",
+      alexaWebhook: "/alexa-webhook",
+      alexaCommand: "/alexa-command"
+    },
+
+    socketIO: true,
+
+    timestamp: now()
   });
 });
 
-// ------------------------------------------------------------
-// Health
-// ------------------------------------------------------------
+// ============================================================
+// HEALTH
+// ============================================================
 
 app.get("/health", (req, res) => {
+  info("Health check requested");
+
   res.status(200).json({
     status: "ok",
     online: true,
+
+    service: "Alexa Device Bridge",
+
+    nodeVersion: process.version,
+
+    environment:
+      process.env.NODE_ENV || "development",
+
+    pid: process.pid,
+
+    port: PORT,
+
     uptime: process.uptime(),
+
     connectedDevices:
       connectedDevices.size,
-    timestamp:
-      new Date().toISOString(),
+
+    pendingCommands:
+      pendingCommands.size,
+
+    bridgeSecret:
+      Boolean(process.env.BRIDGE_SECRET),
+
+    alexaSignatureVerification:
+      true,
+
+    timestamp: now()
   });
 });
 
-// ------------------------------------------------------------
-// Status
-// ------------------------------------------------------------
+// ============================================================
+// STATUS
+// ============================================================
 
 app.get("/status", (req, res) => {
+  info("Status endpoint requested");
+
   const devices = Array.from(
     connectedDevices.values()
   ).map((device) => ({
     deviceName: device.deviceName,
     platform: device.platform,
     connectedAt: device.connectedAt,
+    socketId: device.socket.id
   }));
 
   res.status(200).json({
     online: true,
-    connectedDevices: devices,
+
     deviceCount: devices.length,
+
+    connectedDevices: devices,
+
+    pendingCommands:
+      pendingCommands.size,
+
     uptime: process.uptime(),
-    timestamp:
-      new Date().toISOString(),
+
+    timestamp: now()
   });
 });
 
 // ============================================================
-// ALEXA SIGNATURE VERIFICATION HELPERS
+// HEADER HELPER
 // ============================================================
 
-// ------------------------------------------------------------
-// Get request header case-insensitively
-// ------------------------------------------------------------
-
 function getHeader(req, name) {
-  const target =
-    name.toLowerCase();
+  const target = name.toLowerCase();
 
-  for (const key of Object.keys(
-    req.headers
-  )) {
-    if (
-      key.toLowerCase() === target
-    ) {
+  for (const key of Object.keys(req.headers)) {
+    if (key.toLowerCase() === target) {
       return req.headers[key];
     }
   }
@@ -219,26 +341,22 @@ function getHeader(req, name) {
   return undefined;
 }
 
-// ------------------------------------------------------------
-// Validate SignatureCertChainUrl
-// ------------------------------------------------------------
-//
-// Alexa documentation requires the certificate URL to use:
-//
-// https://s3.amazonaws.com/echo.api/...
-//
-// ------------------------------------------------------------
+// ============================================================
+// ALEXA CERTIFICATE URL VALIDATION
+// ============================================================
 
-function validateCertificateUrl(
-  certificateUrl
-) {
+function validateCertificateUrl(certificateUrl) {
   try {
-    const url =
-      new URL(certificateUrl);
+    const url = new URL(certificateUrl);
 
-    if (
-      url.protocol !== "https:"
-    ) {
+    debug("Alexa certificate URL", {
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port,
+      pathname: url.pathname
+    });
+
+    if (url.protocol !== "https:") {
       return false;
     }
 
@@ -250,9 +368,7 @@ function validateCertificateUrl(
     }
 
     if (
-      !url.pathname.startsWith(
-        "/echo.api/"
-      )
+      !url.pathname.startsWith("/echo.api/")
     ) {
       return false;
     }
@@ -265,101 +381,125 @@ function validateCertificateUrl(
     }
 
     return true;
-  } catch {
+
+  } catch (err) {
+    errorLog(
+      "Certificate URL parsing failed",
+      err
+    );
+
     return false;
   }
 }
 
-// ------------------------------------------------------------
-// Download Alexa signing certificate
-// ------------------------------------------------------------
+// ============================================================
+// DOWNLOAD ALEXA CERTIFICATE
+// ============================================================
 
-function downloadCertificate(
-  certificateUrl
-) {
-  return new Promise(
-    (resolve, reject) => {
-      const request =
-        https.get(
-          certificateUrl,
-          {
-            timeout: 5000,
-          },
-          (response) => {
-            if (
-              response.statusCode !==
-              200
-            ) {
-              response.resume();
+function downloadCertificate(certificateUrl) {
+  return new Promise((resolve, reject) => {
 
-              reject(
-                new Error(
-                  `Certificate download failed with HTTP ${response.statusCode}`
-                )
-              );
+    debug(
+      "Downloading Alexa signing certificate..."
+    );
 
-              return;
-            }
+    const request = https.get(
+      certificateUrl,
+      {
+        timeout: 10000
+      },
 
-            const chunks = [];
+      (response) => {
 
-            response.on(
-              "data",
-              (chunk) => {
-                chunks.push(chunk);
-              }
-            );
-
-            response.on(
-              "end",
-              () => {
-                resolve(
-                  Buffer.concat(
-                    chunks
-                  ).toString("utf8")
-                );
-              }
-            );
-          }
+        debug(
+          "Alexa certificate HTTP status",
+          response.statusCode
         );
 
-      request.on(
-        "timeout",
-        () => {
-          request.destroy();
+        if (
+          response.statusCode !== 200
+        ) {
+
+          response.resume();
 
           reject(
             new Error(
-              "Certificate download timed out"
+              `Certificate download failed with HTTP ${response.statusCode}`
             )
           );
-        }
-      );
 
-      request.on(
-        "error",
-        (error) => {
-          reject(error);
+          return;
         }
-      );
-    }
-  );
+
+        const chunks = [];
+
+        response.on(
+          "data",
+          (chunk) => {
+            chunks.push(chunk);
+          }
+        );
+
+        response.on(
+          "end",
+          () => {
+
+            const certificate =
+              Buffer.concat(chunks)
+                .toString("utf8");
+
+            debug(
+              "Alexa certificate downloaded",
+              {
+                bytes: certificate.length
+              }
+            );
+
+            resolve(certificate);
+          }
+        );
+      }
+    );
+
+    request.on(
+      "timeout",
+      () => {
+
+        request.destroy();
+
+        reject(
+          new Error(
+            "Certificate download timed out"
+          )
+        );
+      }
+    );
+
+    request.on(
+      "error",
+      (err) => {
+        reject(err);
+      }
+    );
+  });
 }
 
-// ------------------------------------------------------------
-// Validate signing certificate
-// ------------------------------------------------------------
+// ============================================================
+// VALIDATE SIGNING CERTIFICATE
+// ============================================================
 
 function validateSigningCertificate(
   certificatePem
 ) {
+
   try {
+
     const certificate =
       new crypto.X509Certificate(
         certificatePem
       );
 
-    const now =
+    const currentTime =
       Date.now();
 
     const validFrom =
@@ -372,34 +512,50 @@ function validateSigningCertificate(
         certificate.validTo
       ).getTime();
 
+    debug(
+      "Alexa certificate dates",
+      {
+        validFrom:
+          certificate.validFrom,
+
+        validTo:
+          certificate.validTo
+      }
+    );
+
     if (
       Number.isNaN(validFrom) ||
       Number.isNaN(validTo)
     ) {
+
       return {
         valid: false,
+
         reason:
-          "Certificate validity dates could not be read",
+          "Certificate validity dates could not be read"
       };
     }
 
     if (
-      now < validFrom ||
-      now > validTo
+      currentTime < validFrom ||
+      currentTime > validTo
     ) {
+
       return {
         valid: false,
+
         reason:
-          "Alexa signing certificate is expired or not yet valid",
+          "Alexa signing certificate is expired or not yet valid"
       };
     }
 
-    // Alexa requires echo-api.amazon.com
-    // in the certificate SAN.
-
     const san =
-      certificate.subjectAltName ||
-      "";
+      certificate.subjectAltName || "";
+
+    debug(
+      "Alexa certificate SAN",
+      san
+    );
 
     const sanEntries =
       san
@@ -414,42 +570,51 @@ function validateSigningCertificate(
           )
         );
 
-    const hasAlexaSan =
+    const hasAlexaSAN =
       sanEntries.some(
         (entry) =>
           entry.toLowerCase() ===
           "echo-api.amazon.com"
       );
 
-    if (!hasAlexaSan) {
+    if (!hasAlexaSAN) {
+
       return {
         valid: false,
+
         reason:
-          "Certificate SAN does not contain echo-api.amazon.com",
+          "Certificate SAN does not contain echo-api.amazon.com"
       };
     }
 
     return {
       valid: true,
-      certificate,
+      certificate
     };
-  } catch (error) {
+
+  } catch (err) {
+
     return {
       valid: false,
+
       reason:
         "Invalid X.509 certificate: " +
-        error.message,
+        err.message
     };
   }
 }
 
-// ------------------------------------------------------------
-// Verify Alexa request signature
-// ------------------------------------------------------------
+// ============================================================
+// VERIFY ALEXA REQUEST
+// ============================================================
 
-async function verifyAlexaRequest(
-  req
-) {
+async function verifyAlexaRequest(req) {
+
+  console.log("");
+  console.log(
+    "[ALEXA SECURITY] Starting signature verification..."
+  );
+
   const certificateUrl =
     getHeader(
       req,
@@ -462,55 +627,85 @@ async function verifyAlexaRequest(
       "Signature-256"
     );
 
+  console.log(
+    "[ALEXA SECURITY] Certificate URL:",
+    certificateUrl
+      ? "PRESENT"
+      : "MISSING"
+  );
+
+  console.log(
+    "[ALEXA SECURITY] Signature:",
+    signature
+      ? "PRESENT"
+      : "MISSING"
+  );
+
   if (!certificateUrl) {
+
     return {
       valid: false,
+
       reason:
-        "Missing SignatureCertChainUrl header",
+        "Missing SignatureCertChainUrl header"
     };
   }
 
   if (!signature) {
+
     return {
       valid: false,
+
       reason:
-        "Missing Signature-256 header",
+        "Missing Signature-256 header"
     };
   }
 
-  // Validate certificate URL.
+  // ----------------------------------------------------------
+  // Validate URL
+  // ----------------------------------------------------------
 
   if (
     !validateCertificateUrl(
       certificateUrl
     )
   ) {
+
     return {
       valid: false,
+
       reason:
-        "Invalid SignatureCertChainUrl",
+        "Invalid SignatureCertChainUrl"
     };
   }
 
-  // Download signing certificate.
+  // ----------------------------------------------------------
+  // Download certificate
+  // ----------------------------------------------------------
 
   let certificatePem;
 
   try {
+
     certificatePem =
       await downloadCertificate(
         certificateUrl
       );
-  } catch (error) {
+
+  } catch (err) {
+
     return {
       valid: false,
+
       reason:
         "Could not download Alexa signing certificate: " +
-        error.message,
+        err.message
     };
   }
 
-  // Validate certificate.
+  // ----------------------------------------------------------
+  // Validate certificate
+  // ----------------------------------------------------------
 
   const certificateResult =
     validateSigningCertificate(
@@ -520,40 +715,54 @@ async function verifyAlexaRequest(
   if (
     !certificateResult.valid
   ) {
+
     return certificateResult;
   }
 
-  // Raw body is required.
+  // ----------------------------------------------------------
+  // Raw body
+  // ----------------------------------------------------------
 
   if (!req.rawBody) {
+
     return {
       valid: false,
+
       reason:
-        "Raw request body is unavailable",
+        "Raw request body is unavailable"
     };
   }
 
-  // Decode Base64 signature.
+  // ----------------------------------------------------------
+  // Signature
+  // ----------------------------------------------------------
 
   let signatureBuffer;
 
   try {
+
     signatureBuffer =
       Buffer.from(
         signature,
         "base64"
       );
-  } catch {
+
+  } catch (err) {
+
     return {
       valid: false,
+
       reason:
-        "Invalid Signature-256 encoding",
+        "Invalid Signature-256 encoding"
     };
   }
 
-  // Verify RSA SHA-256 signature.
+  // ----------------------------------------------------------
+  // RSA SHA256
+  // ----------------------------------------------------------
 
   try {
+
     const verifier =
       crypto.createVerify(
         "RSA-SHA256"
@@ -567,327 +776,443 @@ async function verifyAlexaRequest(
 
     const verified =
       verifier.verify(
-        certificateResult.certificate.publicKey,
+        certificateResult
+          .certificate
+          .publicKey,
+
         signatureBuffer
       );
 
+    console.log(
+      "[ALEXA SECURITY] Signature:",
+      verified
+        ? "VALID"
+        : "INVALID"
+    );
+
     if (!verified) {
+
       return {
         valid: false,
+
         reason:
-          "Alexa request signature verification failed",
+          "Alexa request signature verification failed"
       };
     }
 
     return {
-      valid: true,
+      valid: true
     };
-  } catch (error) {
+
+  } catch (err) {
+
     return {
       valid: false,
+
       reason:
         "Signature verification error: " +
-        error.message,
+        err.message
     };
   }
 }
 
-// ------------------------------------------------------------
-// Verify Alexa timestamp
-// ------------------------------------------------------------
+// ============================================================
+// VERIFY ALEXA TIMESTAMP
+// ============================================================
 
-function verifyAlexaTimestamp(
-  req
-) {
+function verifyAlexaTimestamp(req) {
+
   const timestamp =
     req.body?.request?.timestamp;
 
+  console.log(
+    "[ALEXA SECURITY] Alexa timestamp:",
+    timestamp || "MISSING"
+  );
+
   if (!timestamp) {
+
     return {
       valid: false,
+
       reason:
-        "Alexa request timestamp is missing",
+        "Alexa request timestamp is missing"
     };
   }
 
   const requestTime =
-    new Date(timestamp).getTime();
+    new Date(
+      timestamp
+    ).getTime();
 
   if (
     Number.isNaN(requestTime)
   ) {
+
     return {
       valid: false,
+
       reason:
-        "Alexa request timestamp is invalid",
+        "Alexa request timestamp is invalid"
     };
   }
 
   const difference =
     Math.abs(
       Date.now() -
-        requestTime
+      requestTime
     );
+
+  console.log(
+    "[ALEXA SECURITY] Timestamp difference:",
+    `${difference}ms`
+  );
 
   if (
     difference >
     ALEXA_TIMESTAMP_TOLERANCE_MS
   ) {
+
     return {
       valid: false,
+
       reason:
-        "Alexa request timestamp is outside the allowed tolerance",
+        "Alexa request timestamp is outside the allowed tolerance"
     };
   }
 
   return {
-    valid: true,
+    valid: true
   };
 }
 
 // ============================================================
-// SOCKET.IO - DEVICE CONNECTION
+// SOCKET.IO CONNECTION
 // ============================================================
 
 io.on(
   "connection",
   (socket) => {
+
+    console.log("");
+    separator();
+
     console.log(
-      "=========================================="
+      "[SOCKET] NEW CONNECTION"
     );
 
     console.log(
-      "New socket connected:",
+      "[SOCKET] Socket ID:",
       socket.id
     );
 
     console.log(
-      "=========================================="
+      "[SOCKET] IP:",
+      socket.handshake.address
     );
 
-    // --------------------------------------------------------
-    // DEVICE REGISTER
-    // --------------------------------------------------------
+    console.log(
+      "[SOCKET] Transport:",
+      socket.conn.transport.name
+    );
+
+    separator();
+
+    // ========================================================
+    // REGISTER DEVICE
+    // ========================================================
 
     socket.on(
       "register",
       (data = {}) => {
-        try {
-          console.log(
-            "Register request from:",
-            socket.id
-          );
 
-          // Validate secret.
+        console.log("");
+        console.log(
+          "[DEVICE] REGISTER REQUEST"
+        );
 
-          if (
-            data.secret !==
-            SHARED_SECRET
-          ) {
-            console.log(
-              "Registration rejected: Invalid secret from",
-              socket.id
-            );
+        console.dir(
+          {
+            socketId:
+              socket.id,
 
-            socket.emit(
-              "register_failed",
-              {
-                reason:
-                  "Invalid secret",
-              }
-            );
+            deviceName:
+              data.deviceName,
 
-            socket.disconnect(
-              true
-            );
+            platform:
+              data.platform,
 
-            return;
+            hasSecret:
+              Boolean(data.secret)
+          },
+          {
+            depth: 10
           }
+        );
 
-          // Device name.
+        // ------------------------------------------------------
+        // SECRET
+        // ------------------------------------------------------
 
-          const deviceName =
-            typeof data.deviceName ===
-              "string" &&
-            data.deviceName.trim()
-              ? data.deviceName.trim()
-              : "Unknown Device";
+        if (
+          data.secret !==
+          SHARED_SECRET
+        ) {
 
-          // Platform.
-
-          const platform =
-            typeof data.platform ===
-              "string" &&
-            data.platform.trim()
-              ? data.platform.trim()
-              : "unknown";
-
-          // Store device.
-
-          connectedDevices.set(
-            socket.id,
-            {
-              deviceName,
-              platform,
-              socket,
-              connectedAt:
-                new Date().toISOString(),
-            }
-          );
-
-          console.log(
-            `Device registered: ${deviceName} (${platform})`
-          );
-
-          // Registration success.
-
-          socket.emit(
-            "registered",
-            {
-              ok: true,
-              deviceName,
-              platform,
-            }
-          );
-
-          broadcastDeviceList();
-        } catch (error) {
-          console.error(
-            "Registration error:",
-            error
+          warn(
+            "Device registration rejected: invalid secret"
           );
 
           socket.emit(
             "register_failed",
             {
               reason:
-                "Registration failed",
+                "Invalid secret"
             }
           );
+
+          socket.disconnect(
+            true
+          );
+
+          return;
         }
-      }
-    );
 
-    // --------------------------------------------------------
-    // COMMAND RESULT
-    // --------------------------------------------------------
+        // ------------------------------------------------------
+        // DEVICE NAME
+        // ------------------------------------------------------
 
-    socket.on(
-      "command_result",
-      (data = {}) => {
-        try {
-          const commandId =
-            data.commandId;
+        const deviceName =
+          typeof data.deviceName ===
+          "string" &&
+          data.deviceName.trim()
+            ? data.deviceName.trim()
+            : "Unknown Device";
 
-          if (!commandId) {
-            console.log(
-              "command_result received without commandId"
-            );
+        // ------------------------------------------------------
+        // PLATFORM
+        // ------------------------------------------------------
 
-            return;
-          }
+        const platform =
+          typeof data.platform ===
+          "string" &&
+          data.platform.trim()
+            ? data.platform.trim()
+            : "unknown";
 
-          const pending =
-            pendingCommands.get(
-              commandId
-            );
+        // ------------------------------------------------------
+        // STORE
+        // ------------------------------------------------------
 
-          if (!pending) {
-            console.log(
-              "No pending command found for:",
-              commandId
-            );
-
-            return;
-          }
-
-          clearTimeout(
-            pending.timeout
-          );
-
-          pending.resolve(
-            data.result || {}
-          );
-
-          pendingCommands.delete(
-            commandId
-          );
-
-          console.log(
-            `Command completed: ${commandId}`
-          );
-        } catch (error) {
-          console.error(
-            "command_result error:",
-            error
-          );
-        }
-      }
-    );
-
-    // --------------------------------------------------------
-    // DEVICE PING
-    // --------------------------------------------------------
-
-    socket.on(
-      "ping",
-      () => {
-        socket.emit(
-          "pong",
+        connectedDevices.set(
+          socket.id,
           {
-            timestamp:
-              Date.now(),
+            deviceName,
+            platform,
+            socket,
+            connectedAt:
+              now()
           }
         );
-      }
-    );
 
-    // --------------------------------------------------------
-    // DISCONNECT
-    // --------------------------------------------------------
-
-    socket.on(
-      "disconnect",
-      (reason) => {
-        const device =
-          connectedDevices.get(
-            socket.id
-          );
-
-        if (device) {
-          console.log(
-            `Device disconnected: ${device.deviceName}`
-          );
-        } else {
-          console.log(
-            `Socket disconnected: ${socket.id}`
-          );
-        }
+        console.log("");
+        console.log(
+          "****************************************************"
+        );
 
         console.log(
-          "Disconnect reason:",
-          reason
+          "[DEVICE] DEVICE REGISTERED"
         );
 
-        connectedDevices.delete(
+        console.log(
+          "[DEVICE] Name:",
+          deviceName
+        );
+
+        console.log(
+          "[DEVICE] Platform:",
+          platform
+        );
+
+        console.log(
+          "[DEVICE] Socket:",
           socket.id
+        );
+
+        console.log(
+          "[DEVICE] Total connected:",
+          connectedDevices.size
+        );
+
+        console.log(
+          "****************************************************"
+        );
+
+        socket.emit(
+          "registered",
+          {
+            ok: true,
+
+            deviceName,
+
+            platform
+          }
         );
 
         broadcastDeviceList();
       }
     );
 
-    // --------------------------------------------------------
+    // ========================================================
+    // COMMAND RESULT
+    // ========================================================
+
+    socket.on(
+      "command_result",
+      (data = {}) => {
+
+        console.log("");
+        console.log(
+          "[DEVICE] COMMAND RESULT RECEIVED"
+        );
+
+        console.dir(
+          data,
+          {
+            depth: 10
+          }
+        );
+
+        const commandId =
+          data.commandId;
+
+        if (!commandId) {
+
+          warn(
+            "command_result has no commandId"
+          );
+
+          return;
+        }
+
+        const pending =
+          pendingCommands.get(
+            commandId
+          );
+
+        if (!pending) {
+
+          warn(
+            "No pending command found",
+            commandId
+          );
+
+          return;
+        }
+
+        clearTimeout(
+          pending.timeout
+        );
+
+        pending.resolve(
+          data.result || {}
+        );
+
+        pendingCommands.delete(
+          commandId
+        );
+
+        console.log(
+          "[COMMAND] Completed:",
+          commandId
+        );
+      }
+    );
+
+    // ========================================================
+    // DEVICE PING
+    // ========================================================
+
+    socket.on(
+      "ping",
+      () => {
+
+        console.log(
+          "[DEVICE] Ping received:",
+          socket.id
+        );
+
+        socket.emit(
+          "pong",
+          {
+            timestamp:
+              Date.now()
+          }
+        );
+      }
+    );
+
+    // ========================================================
     // SOCKET ERROR
-    // --------------------------------------------------------
+    // ========================================================
 
     socket.on(
       "error",
-      (error) => {
-        console.error(
-          `Socket error (${socket.id}):`,
-          error
+      (err) => {
+
+        errorLog(
+          `[SOCKET ${socket.id}] Socket error`,
+          err
         );
+      }
+    );
+
+    // ========================================================
+    // DISCONNECT
+    // ========================================================
+
+    socket.on(
+      "disconnect",
+      (reason) => {
+
+        console.log("");
+        console.log(
+          "[SOCKET] DISCONNECTED"
+        );
+
+        console.log(
+          "[SOCKET] ID:",
+          socket.id
+        );
+
+        console.log(
+          "[SOCKET] Reason:",
+          reason
+        );
+
+        const device =
+          connectedDevices.get(
+            socket.id
+          );
+
+        if (device) {
+
+          console.log(
+            "[DEVICE] Disconnected:",
+            device.deviceName
+          );
+        }
+
+        connectedDevices.delete(
+          socket.id
+        );
+
+        console.log(
+          "[DEVICE] Connected devices:",
+          connectedDevices.size
+        );
+
+        broadcastDeviceList();
       }
     );
   }
@@ -898,6 +1223,7 @@ io.on(
 // ============================================================
 
 function broadcastDeviceList() {
+
   const list =
     Array.from(
       connectedDevices.values()
@@ -905,8 +1231,12 @@ function broadcastDeviceList() {
       (device) => ({
         deviceName:
           device.deviceName,
+
         platform:
           device.platform,
+
+        connectedAt:
+          device.connectedAt
       })
     );
 
@@ -916,8 +1246,54 @@ function broadcastDeviceList() {
   );
 
   console.log(
-    `Connected devices: ${list.length}`
+    "[DEVICE LIST] Broadcasting:",
+    list
   );
+}
+
+// ============================================================
+// FIND DEVICE
+// ============================================================
+
+function findDevice(
+  targetDeviceName = null
+) {
+
+  console.log(
+    "[DEVICE] Looking for device:",
+    targetDeviceName || "ANY DEVICE"
+  );
+
+  console.log(
+    "[DEVICE] Available devices:",
+    connectedDevices.size
+  );
+
+  let target = null;
+
+  for (
+    const device of
+    connectedDevices.values()
+  ) {
+
+    console.log(
+      "[DEVICE] Checking:",
+      device.deviceName
+    );
+
+    if (
+      !targetDeviceName ||
+      device.deviceName ===
+      targetDeviceName
+    ) {
+
+      target = device;
+
+      break;
+    }
+  }
+
+  return target;
 }
 
 // ============================================================
@@ -930,33 +1306,53 @@ function sendCommandToDevice(
   targetDeviceName = null,
   timeoutMs = 8000
 ) {
+
   return new Promise(
     (resolve, reject) => {
-      let target = null;
 
-      // ------------------------------------------------------
-      // Find target device
-      // ------------------------------------------------------
+      console.log("");
+      separator();
 
-      for (
-        const device of
-          connectedDevices.values()
-      ) {
-        if (
-          !targetDeviceName ||
-          device.deviceName ===
-            targetDeviceName
-        ) {
-          target = device;
-          break;
+      console.log(
+        "[COMMAND] Preparing command"
+      );
+
+      console.log(
+        "[COMMAND] Type:",
+        commandType
+      );
+
+      console.log(
+        "[COMMAND] Target:",
+        targetDeviceName || "ANY"
+      );
+
+      console.log(
+        "[COMMAND] Payload:"
+      );
+
+      console.dir(
+        payload,
+        {
+          depth: 10
         }
-      }
+      );
 
       // ------------------------------------------------------
-      // No device
+      // DEVICE
       // ------------------------------------------------------
+
+      const target =
+        findDevice(
+          targetDeviceName
+        );
 
       if (!target) {
+
+        console.error(
+          "[COMMAND] NO CONNECTED DEVICE"
+        );
+
         reject(
           new Error(
             "No connected device found"
@@ -967,36 +1363,37 @@ function sendCommandToDevice(
       }
 
       // ------------------------------------------------------
-      // Generate command ID
+      // COMMAND ID
       // ------------------------------------------------------
 
       const commandId =
         crypto.randomUUID();
 
       console.log(
-        "Sending command:"
+        "[COMMAND] Command ID:",
+        commandId
       );
 
-      console.log({
-        commandId,
-        commandType,
-        targetDevice:
-          target.deviceName,
-      });
+      console.log(
+        "[COMMAND] Sending to:",
+        target.deviceName
+      );
 
       // ------------------------------------------------------
-      // Timeout
+      // TIMEOUT
       // ------------------------------------------------------
 
       const timeout =
         setTimeout(
           () => {
-            pendingCommands.delete(
+
+            console.error(
+              "[COMMAND] TIMEOUT:",
               commandId
             );
 
-            console.log(
-              `Command timed out: ${commandId}`
+            pendingCommands.delete(
+              commandId
             );
 
             reject(
@@ -1004,12 +1401,13 @@ function sendCommandToDevice(
                 "Device did not respond in time"
               )
             );
+
           },
           timeoutMs
         );
 
       // ------------------------------------------------------
-      // Save pending command
+      // SAVE PENDING
       // ------------------------------------------------------
 
       pendingCommands.set(
@@ -1018,95 +1416,134 @@ function sendCommandToDevice(
           resolve,
           reject,
           timeout,
+
+          commandType,
+
+          deviceName:
+            target.deviceName,
+
+          createdAt:
+            now()
         }
       );
 
       // ------------------------------------------------------
-      // Send command
+      // SEND SOCKET COMMAND
       // ------------------------------------------------------
 
       target.socket.emit(
         "command",
         {
           commandId,
-          type: commandType,
-          payload,
+
+          type:
+            commandType,
+
+          payload
         }
       );
+
+      console.log(
+        "[COMMAND] Socket command emitted successfully"
+      );
+
+      separator();
     }
   );
 }
 
 // ============================================================
-// ALEXA COMMAND ENDPOINT
+// ALEXA COMMAND API
 // ============================================================
 
 app.post(
   "/alexa-command",
   async (req, res) => {
+
+    console.log("");
+    console.log(
+      "####################################################"
+    );
+
+    console.log(
+      "[ALEXA COMMAND API] REQUEST"
+    );
+
+    console.dir(
+      req.body,
+      {
+        depth: 10
+      }
+    );
+
+    console.log(
+      "####################################################"
+    );
+
     try {
-      console.log(
-        "=== /alexa-command ==="
-      );
 
       const {
         secret,
         command,
         deviceName,
-        payload,
-      } = req.body || {};
+        payload
+      } =
+        req.body || {};
 
       // ------------------------------------------------------
-      // Validate secret
+      // SECRET
       // ------------------------------------------------------
 
       if (
         secret !==
         SHARED_SECRET
       ) {
-        console.log(
-          "Alexa command rejected: Unauthorized"
+
+        warn(
+          "[ALEXA COMMAND API] Unauthorized"
         );
 
         return res
           .status(401)
           .json({
             error:
-              "Unauthorized",
+              "Unauthorized"
           });
       }
 
       // ------------------------------------------------------
-      // Validate command
+      // COMMAND
       // ------------------------------------------------------
 
       if (!command) {
+
         return res
           .status(400)
           .json({
             error:
-              "Command is required",
+              "Command is required"
           });
       }
 
       // ------------------------------------------------------
-      // Check connected device
+      // DEVICES
       // ------------------------------------------------------
 
       if (
         connectedDevices.size ===
         0
       ) {
+
         return res
           .status(200)
           .json({
             speech:
-              "Your device is not connected to the bridge right now.",
+              "Your device is not connected to the bridge right now."
           });
       }
 
       // ------------------------------------------------------
-      // Send command
+      // SEND
       // ------------------------------------------------------
 
       const result =
@@ -1116,18 +1553,33 @@ app.post(
           deviceName || null
         );
 
+      console.log(
+        "[ALEXA COMMAND API] RESULT:"
+      );
+
+      console.dir(
+        result,
+        {
+          depth: 10
+        }
+      );
+
       return res
         .status(200)
         .json({
           speech:
             result?.speech ||
             "Done.",
-          raw: result,
+
+          raw:
+            result
         });
-    } catch (error) {
-      console.error(
-        "/alexa-command error:",
-        error
+
+    } catch (err) {
+
+      errorLog(
+        "[ALEXA COMMAND API] Error",
+        err
       );
 
       return res
@@ -1135,113 +1587,145 @@ app.post(
         .json({
           speech:
             "Sorry, I could not reach your device.",
+
           error:
-            error.message,
+            err.message
         });
     }
   }
 );
 
 // ============================================================
-// ALEXA WEBHOOK
+// ALEXA WEBHOOK - GET TEST
 // ============================================================
-
-// ------------------------------------------------------------
-// GET /alexa-webhook
-//
-// Browser / Cloudflare connectivity test only.
-//
-// Alexa itself sends POST.
-// ------------------------------------------------------------
 
 app.get(
   "/alexa-webhook",
   (req, res) => {
+
+    console.log("");
+    separator();
+
     console.log(
-      "GET /alexa-webhook - browser test"
+      "[ALEXA WEBHOOK] GET TEST"
     );
+
+    console.log(
+      "[ALEXA WEBHOOK] This means public URL is reachable."
+    );
+
+    separator();
 
     res
       .status(200)
       .json({
         online: true,
+
+        service:
+          "Alexa Device Bridge",
+
         endpoint:
           "/alexa-webhook",
-        method: "POST",
+
+        method:
+          "POST",
+
         message:
-          "Alexa webhook is reachable. Alexa requests must use POST.",
+          "Alexa webhook is reachable. Alexa itself will use POST.",
+
+        alexaReady:
+          true,
+
         timestamp:
-          new Date().toISOString(),
+          now()
       });
   }
 );
 
-// ------------------------------------------------------------
-// POST /alexa-webhook
-//
-// Actual Alexa endpoint.
-// ------------------------------------------------------------
+// ============================================================
+// ALEXA WEBHOOK - POST
+// ============================================================
 
 app.post(
   "/alexa-webhook",
   async (req, res) => {
+
+    console.log("");
     console.log("");
     console.log(
-      "=========================================="
-    );
-    console.log(
-      "=== ALEXA WEBHOOK HIT ==="
-    );
-    console.log(
-      "=========================================="
+      "############################################################"
     );
 
     console.log(
-      "Alexa request received."
-    );
-
-    // --------------------------------------------------------
-    // Show headers needed for verification
-    // --------------------------------------------------------
-
-    const certificateUrl =
-      getHeader(
-        req,
-        "SignatureCertChainUrl"
-      );
-
-    const signature =
-      getHeader(
-        req,
-        "Signature-256"
-      );
-
-    console.log(
-      "SignatureCertChainUrl:",
-      certificateUrl
-        ? "PRESENT"
-        : "MISSING"
+      "###                 ALEXA WEBHOOK HIT                   ###"
     );
 
     console.log(
-      "Signature-256:",
-      signature
-        ? "PRESENT"
-        : "MISSING"
+      "############################################################"
     );
 
-    // --------------------------------------------------------
-    // Alexa response helper
-    // --------------------------------------------------------
+    console.log(
+      "[ALEXA] Request ID:",
+      req.requestId
+    );
+
+    console.log(
+      "[ALEXA] Time:",
+      now()
+    );
+
+    console.log(
+      "[ALEXA] Request Type:",
+      req.body?.request?.type
+    );
+
+    console.log(
+      "[ALEXA] Intent:",
+      req.body?.request?.intent?.name
+    );
+
+    console.log(
+      "[ALEXA] Timestamp:",
+      req.body?.request?.timestamp
+    );
+
+    console.log(
+      "[ALEXA] Raw body bytes:",
+      req.rawBody
+        ? req.rawBody.length
+        : 0
+    );
+
+    console.log(
+      "[ALEXA] Connected devices:",
+      connectedDevices.size
+    );
+
+    // ========================================================
+    // RESPONSE HELPER
+    // ========================================================
 
     function speak(
       text,
       endSession = true
     ) {
+
+      console.log("");
       console.log(
-        "Replying to Alexa:",
+        "[ALEXA RESPONSE]"
+      );
+
+      console.log(
+        "Speech:",
         text
       );
+
+      console.log(
+        "End session:",
+        endSession
+      );
+
+      console.log("");
 
       return res
         .status(200)
@@ -1249,26 +1733,31 @@ app.post(
           version: "1.0",
 
           response: {
+
             outputSpeech: {
-              type: "PlainText",
-              text: String(
-                text
-              ),
+
+              type:
+                "PlainText",
+
+              text:
+                String(text)
             },
 
             shouldEndSession:
-              endSession,
-          },
+              endSession
+          }
         });
     }
 
     try {
+
       // ======================================================
-      // ALEXA SECURITY VALIDATION
+      // SIGNATURE
       // ======================================================
 
+      console.log("");
       console.log(
-        "Verifying Alexa request..."
+        "[ALEXA SECURITY] Verifying request..."
       );
 
       const signatureResult =
@@ -1279,34 +1768,30 @@ app.post(
       if (
         !signatureResult.valid
       ) {
+
         console.error(
-          "Alexa signature verification failed:",
+          "[ALEXA SECURITY] FAILED:",
           signatureResult.reason
         );
-
-        // During local browser testing,
-        // GET is handled separately.
-        //
-        // For POST requests, reject invalid
-        // or unsigned requests.
 
         return res
           .status(400)
           .json({
             error:
               "Invalid Alexa request",
+
             reason:
-              signatureResult.reason,
+              signatureResult.reason
           });
       }
 
       console.log(
-        "Alexa signature: VALID"
+        "[ALEXA SECURITY] Signature VALID"
       );
 
-      // ------------------------------------------------------
-      // Timestamp validation
-      // ------------------------------------------------------
+      // ======================================================
+      // TIMESTAMP
+      // ======================================================
 
       const timestampResult =
         verifyAlexaTimestamp(
@@ -1316,8 +1801,9 @@ app.post(
       if (
         !timestampResult.valid
       ) {
+
         console.error(
-          "Alexa timestamp validation failed:",
+          "[ALEXA SECURITY] Timestamp FAILED:",
           timestampResult.reason
         );
 
@@ -1326,34 +1812,27 @@ app.post(
           .json({
             error:
               "Invalid Alexa request",
+
             reason:
-              timestampResult.reason,
+              timestampResult.reason
           });
       }
 
       console.log(
-        "Alexa timestamp: VALID"
+        "[ALEXA SECURITY] Timestamp VALID"
       );
 
       // ======================================================
-      // REQUEST BODY
+      // REQUEST
       // ======================================================
 
       const request =
         req.body?.request;
 
-      console.log(
-        "Alexa Request Type:",
-        request?.type
-      );
-
-      // ------------------------------------------------------
-      // Invalid request
-      // ------------------------------------------------------
-
       if (!request) {
-        console.log(
-          "No request field found"
+
+        console.error(
+          "[ALEXA] Missing request object"
         );
 
         return speak(
@@ -1361,16 +1840,23 @@ app.post(
         );
       }
 
+      console.log("");
+      console.log(
+        "[ALEXA] Processing:",
+        request.type
+      );
+
       // ======================================================
-      // LAUNCH REQUEST
+      // LAUNCH
       // ======================================================
 
       if (
         request.type ===
         "LaunchRequest"
       ) {
+
         console.log(
-          "Handling LaunchRequest"
+          "[ALEXA] LaunchRequest"
         );
 
         return speak(
@@ -1380,48 +1866,56 @@ app.post(
       }
 
       // ======================================================
-      // INTENT REQUEST
+      // INTENT
       // ======================================================
 
       if (
         request.type ===
         "IntentRequest"
       ) {
+
         const intentName =
           request.intent?.name;
 
+        console.log("");
         console.log(
-          "Alexa Intent:",
+          "****************************************************"
+        );
+
+        console.log(
+          "[ALEXA] INTENT:",
           intentName
         );
 
-        // ----------------------------------------------------
+        console.log(
+          "****************************************************"
+        );
+
+        // ====================================================
         // CHECK NOTIFICATIONS
-        // ----------------------------------------------------
+        // ====================================================
 
         if (
           intentName ===
           "CheckNotificationsIntent"
         ) {
-          console.log(
-            "CheckNotificationsIntent"
-          );
 
           console.log(
-            "Connected devices:",
-            connectedDevices.size
+            "[ALEXA] CheckNotificationsIntent"
           );
 
           if (
             connectedDevices.size ===
             0
           ) {
+
             return speak(
               "Your device is not connected to the bridge right now."
             );
           }
 
           try {
+
             const result =
               await sendCommandToDevice(
                 "check_notifications"
@@ -1429,12 +1923,14 @@ app.post(
 
             return speak(
               result?.speech ||
-                "You have no new notifications."
+              "You have no new notifications."
             );
-          } catch (error) {
-            console.error(
-              "Notification command error:",
-              error.message
+
+          } catch (err) {
+
+            errorLog(
+              "Notification command failed",
+              err
             );
 
             return speak(
@@ -1443,33 +1939,31 @@ app.post(
           }
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // PING DEVICE
-        // ----------------------------------------------------
+        // ====================================================
 
         if (
           intentName ===
           "PingDeviceIntent"
         ) {
-          console.log(
-            "PingDeviceIntent"
-          );
 
           console.log(
-            "Connected devices:",
-            connectedDevices.size
+            "[ALEXA] PingDeviceIntent"
           );
 
           if (
             connectedDevices.size ===
             0
           ) {
+
             return speak(
               "Your device is not connected to the bridge right now."
             );
           }
 
           try {
+
             const result =
               await sendCommandToDevice(
                 "ping"
@@ -1477,12 +1971,14 @@ app.post(
 
             return speak(
               result?.speech ||
-                "Your device is connected and responding."
+              "Your device is connected and responding."
             );
-          } catch (error) {
-            console.error(
-              "Ping command error:",
-              error.message
+
+          } catch (err) {
+
+            errorLog(
+              "Ping command failed",
+              err
             );
 
             return speak(
@@ -1491,41 +1987,47 @@ app.post(
           }
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // STOP
-        // ----------------------------------------------------
+        // ====================================================
 
         if (
           intentName ===
-            "AMAZON.StopIntent" ||
+          "AMAZON.StopIntent" ||
           intentName ===
-            "AMAZON.CancelIntent"
+          "AMAZON.CancelIntent"
         ) {
+
+          console.log(
+            "[ALEXA] Stop/Cancel"
+          );
+
           return speak(
             "Okay, bye."
           );
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // HELP
-        // ----------------------------------------------------
+        // ====================================================
 
         if (
           intentName ===
           "AMAZON.HelpIntent"
         ) {
+
           return speak(
             "You can say check my notifications, or ping my device.",
             false
           );
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // FALLBACK
-        // ----------------------------------------------------
+        // ====================================================
 
         console.log(
-          "Unhandled intent:",
+          "[ALEXA] Unhandled intent:",
           intentName
         );
 
@@ -1535,15 +2037,16 @@ app.post(
       }
 
       // ======================================================
-      // SESSION ENDED
+      // SESSION END
       // ======================================================
 
       if (
         request.type ===
         "SessionEndedRequest"
       ) {
+
         console.log(
-          "Alexa session ended."
+          "[ALEXA] SessionEndedRequest"
         );
 
         return res
@@ -1552,21 +2055,23 @@ app.post(
       }
 
       // ======================================================
-      // UNKNOWN REQUEST
+      // UNKNOWN
       // ======================================================
 
       console.log(
-        "Unknown Alexa request type:",
+        "[ALEXA] Unknown request type:",
         request.type
       );
 
       return speak(
         "Sorry, I did not understand that."
       );
-    } catch (error) {
-      console.error(
-        "Alexa webhook error:",
-        error
+
+    } catch (err) {
+
+      errorLog(
+        "[ALEXA WEBHOOK] INTERNAL ERROR",
+        err
       );
 
       return res
@@ -1574,24 +2079,48 @@ app.post(
         .json({
           error:
             "Internal Alexa webhook error",
+
+          message:
+            err.message
         });
     }
   }
 );
 
 // ============================================================
-// 404 HANDLER
+// 404
 // ============================================================
 
 app.use(
   (req, res) => {
+
+    console.log("");
+    console.log(
+      "[404] Route not found:",
+      req.method,
+      req.originalUrl
+    );
+
     res
       .status(404)
       .json({
         error:
           "Not Found",
+
         path:
           req.originalUrl,
+
+        method:
+          req.method,
+
+        availableEndpoints: [
+          "GET /",
+          "GET /health",
+          "GET /status",
+          "GET /alexa-webhook",
+          "POST /alexa-webhook",
+          "POST /alexa-command"
+        ]
       });
   }
 );
@@ -1607,14 +2136,16 @@ app.use(
     res,
     next
   ) => {
-    console.error(
-      "Global server error:",
+
+    errorLog(
+      "[GLOBAL SERVER ERROR]",
       err
     );
 
     if (
       res.headersSent
     ) {
+
       return next(err);
     }
 
@@ -1623,31 +2154,108 @@ app.use(
       .json({
         error:
           "Internal Server Error",
+
+        message:
+          err.message
       });
   }
 );
 
 // ============================================================
-// SERVER START
+// STARTUP
 // ============================================================
+
+console.log("");
+console.log("");
+console.log(
+  "############################################################"
+);
+
+console.log(
+  "###          ALEXA DEVICE BRIDGE STARTING              ###"
+);
+
+console.log(
+  "############################################################"
+);
+
+console.log(
+  "[BOOT] Node:",
+  process.version
+);
+
+console.log(
+  "[BOOT] PID:",
+  process.pid
+);
+
+console.log(
+  "[BOOT] Environment:",
+  process.env.NODE_ENV ||
+  "development"
+);
+
+console.log(
+  "[BOOT] PORT:",
+  PORT
+);
+
+console.log(
+  "[BOOT] HOST:",
+  HOST
+);
+
+console.log(
+  "[BOOT] BRIDGE_SECRET:",
+  process.env.BRIDGE_SECRET
+    ? "SET"
+    : "NOT SET - USING FALLBACK"
+);
+
+console.log(
+  "[BOOT] Alexa signature verification: ENABLED"
+);
+
+console.log(
+  "[BOOT] Socket.IO: ENABLED"
+);
+
+console.log(
+  "[BOOT] CORS: ENABLED"
+);
+
+console.log(
+  "[BOOT] Raw Alexa request body: ENABLED"
+);
+
+console.log(
+  "[BOOT] Server can run behind Render/ngrok/Cloudflare/etc."
+);
+
+console.log(
+  "############################################################"
+);
 
 server.listen(
   PORT,
   HOST,
   () => {
+
     console.log("");
     console.log(
-      "=========================================="
-    );
-    console.log(
-      " Alexa Device Bridge - LOCAL"
-    );
-    console.log(
-      "=========================================="
+      "============================================================"
     );
 
     console.log(
-      `Server listening on http://${HOST}:${PORT}`
+      "🚀 ALEXA DEVICE BRIDGE IS ONLINE"
+    );
+
+    console.log(
+      "============================================================"
+    );
+
+    console.log(
+      `Local server: http://127.0.0.1:${PORT}`
     );
 
     console.log(
@@ -1663,15 +2271,39 @@ server.listen(
     );
 
     console.log(
-      `Cloudflare target: http://127.0.0.1:${PORT}`
+      ""
     );
 
     console.log(
-      "Alexa signature verification: ENABLED"
+      "For Render:"
     );
 
     console.log(
-      "=========================================="
+      "https://YOUR-SERVICE.onrender.com/alexa-webhook"
+    );
+
+    console.log(
+      ""
+    );
+
+    console.log(
+      "For ngrok:"
+    );
+
+    console.log(
+      "https://YOUR-NGROK-DOMAIN/alexa-webhook"
+    );
+
+    console.log(
+      ""
+    );
+
+    console.log(
+      "Waiting for Alexa/device connections..."
+    );
+
+    console.log(
+      "============================================================"
     );
 
     console.log("");
@@ -1679,26 +2311,46 @@ server.listen(
 );
 
 // ============================================================
-// GRACEFUL SHUTDOWN
+// SHUTDOWN
 // ============================================================
 
-function shutdown(
-  signal
-) {
+function shutdown(signal) {
+
+  console.log("");
   console.log(
-    `Received ${signal}. Shutting down...`
+    "============================================================"
+  );
+
+  console.log(
+    `[SHUTDOWN] Received ${signal}`
+  );
+
+  console.log(
+    "[SHUTDOWN] Pending commands:",
+    pendingCommands.size
+  );
+
+  console.log(
+    "[SHUTDOWN] Connected devices:",
+    connectedDevices.size
+  );
+
+  console.log(
+    "============================================================"
   );
 
   // ----------------------------------------------------------
-  // Clear pending command timers
+  // Pending commands
   // ----------------------------------------------------------
 
   for (
     const [
       commandId,
-      pending,
-    ] of pendingCommands.entries()
+      pending
+    ]
+    of pendingCommands.entries()
   ) {
+
     clearTimeout(
       pending.timeout
     );
@@ -1715,23 +2367,25 @@ function shutdown(
   }
 
   // ----------------------------------------------------------
-  // Close Socket.IO
+  // Socket.IO
   // ----------------------------------------------------------
 
   io.close(
     () => {
+
       console.log(
-        "Socket.IO closed."
+        "[SHUTDOWN] Socket.IO closed."
       );
 
-      // ------------------------------------------------------
-      // Close HTTP server
-      // ------------------------------------------------------
+      // --------------------------------------------------------
+      // HTTP
+      // --------------------------------------------------------
 
       server.close(
         () => {
+
           console.log(
-            "HTTP server closed."
+            "[SHUTDOWN] HTTP server closed."
           );
 
           process.exit(0);
@@ -1741,16 +2395,18 @@ function shutdown(
   );
 
   // ----------------------------------------------------------
-  // Safety timeout
+  // Force exit
   // ----------------------------------------------------------
 
   setTimeout(
     () => {
-      console.log(
-        "Forced shutdown."
+
+      console.error(
+        "[SHUTDOWN] Forced shutdown."
       );
 
       process.exit(1);
+
     },
     10000
   ).unref();
@@ -1775,25 +2431,102 @@ process.on(
 );
 
 // ============================================================
-// PROCESS ERROR HANDLING
+// CRASH HANDLERS
 // ============================================================
 
 process.on(
   "uncaughtException",
-  (error) => {
+  (err) => {
+
+    console.error("");
     console.error(
-      "UNCAUGHT EXCEPTION:",
-      error
+      "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     );
+
+    console.error(
+      "UNCAUGHT EXCEPTION"
+    );
+
+    console.error(
+      err
+    );
+
+    console.error(
+      "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    // Don't immediately exit so Render logs remain visible.
   }
 );
 
 process.on(
   "unhandledRejection",
   (reason) => {
+
+    console.error("");
     console.error(
-      "UNHANDLED REJECTION:",
+      "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    console.error(
+      "UNHANDLED PROMISE REJECTION"
+    );
+
+    console.error(
       reason
     );
+
+    console.error(
+      "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
   }
+);
+
+// ============================================================
+// PERIODIC DEBUG STATUS
+// ============================================================
+
+// Every 60 seconds print bridge status.
+// Useful on Render because you can see whether the process
+// is still alive and whether a device is connected.
+
+setInterval(
+  () => {
+
+    console.log("");
+    console.log(
+      "[HEARTBEAT]"
+    );
+
+    console.log(
+      "Time:",
+      now()
+    );
+
+    console.log(
+      "Uptime:",
+      `${Math.round(process.uptime())} seconds`
+    );
+
+    console.log(
+      "Connected devices:",
+      connectedDevices.size
+    );
+
+    console.log(
+      "Pending commands:",
+      pendingCommands.size
+    );
+
+    console.log(
+      "Memory:",
+      process.memoryUsage()
+    );
+
+    console.log(
+      ""
+    );
+
+  },
+  60 * 1000
 );
