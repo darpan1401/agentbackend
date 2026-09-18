@@ -1,7 +1,16 @@
+// ============================================================
 // Alexa <-> Device Bridge Server
-// Handles: 1) Device connections (phone/laptop) via Socket.io
-//          2) Commands coming from Alexa Skill (via REST /alexa endpoint)
-//          3) Forwards commands to devices and relays responses back
+// ============================================================
+// Handles:
+// 1) Device connections (phone/laptop) via Socket.io
+// 2) Commands coming from Alexa Skill via REST
+// 3) Forwards commands to connected devices
+// 4) Relays device responses back to Alexa
+//
+// GoDaddy Node.js Hosting compatible
+// ============================================================
+
+"use strict";
 
 const express = require("express");
 const http = require("http");
@@ -9,199 +18,901 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const crypto = require("crypto");
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// ============================================================
+// APP SETUP
+// ============================================================
 
-// Log every single incoming request, no matter the route.
-// This helps confirm whether requests (e.g. from Alexa) are even reaching this server.
+const app = express();
+
+// GoDaddy / reverse proxy friendly
+app.disable("x-powered-by");
+
+// ------------------------------------------------------------
+// CORS
+// ------------------------------------------------------------
+
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// ------------------------------------------------------------
+// JSON BODY PARSER
+// ------------------------------------------------------------
+
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
+
+// ------------------------------------------------------------
+// REQUEST LOGGER
+// ------------------------------------------------------------
+
 app.use((req, res, next) => {
-  console.log(`>>> Incoming request: ${req.method} ${req.originalUrl}`);
+  console.log(
+    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`
+  );
+
   next();
 });
 
+// ============================================================
+// HTTP SERVER
+// ============================================================
+
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 
-// ---- Config ----
-const SHARED_SECRET = process.env.BRIDGE_SECRET || "change-this-secret-123";
+// ============================================================
+// SOCKET.IO
+// ============================================================
 
-// ---- In-memory state ----
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+
+  // Helps when hosted behind a reverse proxy
+  transports: ["websocket", "polling"],
+});
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+// IMPORTANT:
+// Set BRIDGE_SECRET in GoDaddy Environment Variables.
+//
+// Example:
+// BRIDGE_SECRET=your-super-secret-key
+//
+// The fallback is only useful for local development.
+
+const SHARED_SECRET =
+  process.env.BRIDGE_SECRET || "change-this-secret-123";
+
+// ============================================================
+// IN-MEMORY STATE
+// ============================================================
+
 const connectedDevices = new Map();
 const pendingCommands = new Map();
 
-// ---------------- Socket.io: device connections ----------------
-io.on("connection", (socket) => {
-  console.log("New socket connected:", socket.id);
+// ============================================================
+// BASIC / HEALTH ROUTES
+// ============================================================
 
-  socket.on("register", (data) => {
-    if (data.secret !== SHARED_SECRET) {
-      socket.emit("register_failed", { reason: "Invalid secret" });
-      socket.disconnect(true);
-      return;
-    }
-    connectedDevices.set(socket.id, {
-      deviceName: data.deviceName || "Unknown Device",
-      platform: data.platform || "unknown",
-      socket,
-    });
-    console.log(`Device registered: ${data.deviceName} (${data.platform})`);
-    socket.emit("registered", { ok: true });
-    broadcastDeviceList();
-  });
+// ------------------------------------------------------------
+// Root route
+// ------------------------------------------------------------
 
-  socket.on("command_result", (data) => {
-    const pending = pendingCommands.get(data.commandId);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      pending.resolve(data.result);
-      pendingCommands.delete(data.commandId);
-    }
-  });
-
-  socket.on("disconnect", () => {
-    connectedDevices.delete(socket.id);
-    console.log("Device disconnected:", socket.id);
-    broadcastDeviceList();
+app.get("/", (req, res) => {
+  res.status(200).json({
+    name: "Alexa Device Bridge",
+    status: "online",
+    message: "Alexa Device Bridge is running.",
+    timestamp: new Date().toISOString(),
   });
 });
 
-function broadcastDeviceList() {
-  const list = Array.from(connectedDevices.values()).map((d) => ({
-    deviceName: d.deviceName,
-    platform: d.platform,
+// ------------------------------------------------------------
+// Health check
+// ------------------------------------------------------------
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    online: true,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ------------------------------------------------------------
+// Status
+// ------------------------------------------------------------
+
+app.get("/status", (req, res) => {
+  const devices = Array.from(connectedDevices.values()).map((device) => ({
+    deviceName: device.deviceName,
+    platform: device.platform,
   }));
+
+  res.status(200).json({
+    online: true,
+    connectedDevices: devices,
+    deviceCount: devices.length,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ============================================================
+// SOCKET.IO - DEVICE CONNECTION
+// ============================================================
+
+io.on("connection", (socket) => {
+  console.log("==========================================");
+  console.log("New socket connected:", socket.id);
+  console.log("==========================================");
+
+  // ----------------------------------------------------------
+  // DEVICE REGISTER
+  // ----------------------------------------------------------
+
+  socket.on("register", (data = {}) => {
+    try {
+      console.log("Register request from:", socket.id);
+
+      // Validate secret
+      if (data.secret !== SHARED_SECRET) {
+        console.log(
+          "Registration rejected: Invalid secret from",
+          socket.id
+        );
+
+        socket.emit("register_failed", {
+          reason: "Invalid secret",
+        });
+
+        socket.disconnect(true);
+        return;
+      }
+
+      const deviceName =
+        typeof data.deviceName === "string" && data.deviceName.trim()
+          ? data.deviceName.trim()
+          : "Unknown Device";
+
+      const platform =
+        typeof data.platform === "string" && data.platform.trim()
+          ? data.platform.trim()
+          : "unknown";
+
+      connectedDevices.set(socket.id, {
+        deviceName,
+        platform,
+        socket,
+        connectedAt: new Date().toISOString(),
+      });
+
+      console.log(
+        `Device registered: ${deviceName} (${platform})`
+      );
+
+      socket.emit("registered", {
+        ok: true,
+        deviceName,
+        platform,
+      });
+
+      broadcastDeviceList();
+    } catch (error) {
+      console.error("Registration error:", error);
+
+      socket.emit("register_failed", {
+        reason: "Registration failed",
+      });
+    }
+  });
+
+  // ----------------------------------------------------------
+  // COMMAND RESULT
+  // ----------------------------------------------------------
+
+  socket.on("command_result", (data = {}) => {
+    try {
+      const commandId = data.commandId;
+
+      if (!commandId) {
+        console.log("command_result received without commandId");
+        return;
+      }
+
+      const pending = pendingCommands.get(commandId);
+
+      if (!pending) {
+        console.log(
+          "No pending command found for:",
+          commandId
+        );
+        return;
+      }
+
+      clearTimeout(pending.timeout);
+
+      pending.resolve(data.result || {});
+
+      pendingCommands.delete(commandId);
+
+      console.log(
+        `Command completed: ${commandId}`
+      );
+    } catch (error) {
+      console.error("command_result error:", error);
+    }
+  });
+
+  // ----------------------------------------------------------
+  // DEVICE PING
+  // ----------------------------------------------------------
+
+  socket.on("ping", () => {
+    socket.emit("pong", {
+      timestamp: Date.now(),
+    });
+  });
+
+  // ----------------------------------------------------------
+  // DISCONNECT
+  // ----------------------------------------------------------
+
+  socket.on("disconnect", (reason) => {
+    const device = connectedDevices.get(socket.id);
+
+    if (device) {
+      console.log(
+        `Device disconnected: ${device.deviceName}`
+      );
+    } else {
+      console.log(
+        `Socket disconnected: ${socket.id}`
+      );
+    }
+
+    console.log("Disconnect reason:", reason);
+
+    connectedDevices.delete(socket.id);
+
+    broadcastDeviceList();
+  });
+
+  // ----------------------------------------------------------
+  // SOCKET ERROR
+  // ----------------------------------------------------------
+
+  socket.on("error", (error) => {
+    console.error(
+      `Socket error (${socket.id}):`,
+      error
+    );
+  });
+});
+
+// ============================================================
+// BROADCAST DEVICE LIST
+// ============================================================
+
+function broadcastDeviceList() {
+  const list = Array.from(connectedDevices.values()).map(
+    (device) => ({
+      deviceName: device.deviceName,
+      platform: device.platform,
+    })
+  );
+
   io.emit("device_list", list);
+
+  console.log(
+    `Connected devices: ${list.length}`
+  );
 }
 
-function sendCommandToDevice(commandType, payload = {}, targetDeviceName = null, timeoutMs = 8000) {
+// ============================================================
+// SEND COMMAND TO DEVICE
+// ============================================================
+
+function sendCommandToDevice(
+  commandType,
+  payload = {},
+  targetDeviceName = null,
+  timeoutMs = 8000
+) {
   return new Promise((resolve, reject) => {
     let target = null;
-    for (const dev of connectedDevices.values()) {
-      if (!targetDeviceName || dev.deviceName === targetDeviceName) {
-        target = dev;
+
+    // --------------------------------------------------------
+    // Find target device
+    // --------------------------------------------------------
+
+    for (const device of connectedDevices.values()) {
+      if (
+        !targetDeviceName ||
+        device.deviceName === targetDeviceName
+      ) {
+        target = device;
         break;
       }
     }
+
+    // --------------------------------------------------------
+    // No device
+    // --------------------------------------------------------
+
     if (!target) {
-      reject(new Error("No connected device found"));
+      reject(
+        new Error("No connected device found")
+      );
+
       return;
     }
 
+    // --------------------------------------------------------
+    // Generate command ID
+    // --------------------------------------------------------
+
     const commandId = crypto.randomUUID();
+
+    console.log("Sending command:");
+    console.log({
+      commandId,
+      commandType,
+      targetDevice:
+        target.deviceName,
+    });
+
+    // --------------------------------------------------------
+    // Timeout
+    // --------------------------------------------------------
+
     const timeout = setTimeout(() => {
       pendingCommands.delete(commandId);
-      reject(new Error("Device did not respond in time"));
+
+      console.log(
+        `Command timed out: ${commandId}`
+      );
+
+      reject(
+        new Error(
+          "Device did not respond in time"
+        )
+      );
     }, timeoutMs);
 
-    pendingCommands.set(commandId, { resolve, reject, timeout });
-    target.socket.emit("command", { commandId, type: commandType, payload });
+    // --------------------------------------------------------
+    // Save pending command
+    // --------------------------------------------------------
+
+    pendingCommands.set(commandId, {
+      resolve,
+      reject,
+      timeout,
+    });
+
+    // --------------------------------------------------------
+    // Send to device
+    // --------------------------------------------------------
+
+    target.socket.emit("command", {
+      commandId,
+      type: commandType,
+      payload,
+    });
   });
 }
 
-// ---------------- REST: status check ----------------
-app.get("/status", (req, res) => {
-  res.json({
-    online: true,
-    connectedDevices: Array.from(connectedDevices.values()).map((d) => ({
-      deviceName: d.deviceName,
-      platform: d.platform,
-    })),
-  });
-});
+// ============================================================
+// ALEXA COMMAND ENDPOINT
+// ============================================================
 
-// ---------------- REST: endpoint for external calls (optional / legacy) ----------------
 app.post("/alexa-command", async (req, res) => {
-  const { secret, command, deviceName, payload } = req.body;
-
-  if (secret !== SHARED_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  if (connectedDevices.size === 0) {
-    return res.json({ speech: "Your device is not connected to the bridge right now." });
-  }
-
   try {
-    const result = await sendCommandToDevice(command, payload || {}, deviceName);
-    return res.json({ speech: result.speech || "Done.", raw: result });
-  } catch (err) {
-    return res.json({ speech: "Sorry, I could not reach your device. " + err.message });
+    console.log("=== /alexa-command ===");
+
+    const {
+      secret,
+      command,
+      deviceName,
+      payload,
+    } = req.body || {};
+
+    // --------------------------------------------------------
+    // Validate secret
+    // --------------------------------------------------------
+
+    if (secret !== SHARED_SECRET) {
+      console.log(
+        "Alexa command rejected: Unauthorized"
+      );
+
+      return res.status(401).json({
+        error: "Unauthorized",
+      });
+    }
+
+    // --------------------------------------------------------
+    // Validate command
+    // --------------------------------------------------------
+
+    if (!command) {
+      return res.status(400).json({
+        error: "Command is required",
+      });
+    }
+
+    // --------------------------------------------------------
+    // Check connected device
+    // --------------------------------------------------------
+
+    if (connectedDevices.size === 0) {
+      return res.status(200).json({
+        speech:
+          "Your device is not connected to the bridge right now.",
+      });
+    }
+
+    // --------------------------------------------------------
+    // Send command
+    // --------------------------------------------------------
+
+    const result = await sendCommandToDevice(
+      command,
+      payload || {},
+      deviceName || null
+    );
+
+    return res.status(200).json({
+      speech: result?.speech || "Done.",
+      raw: result,
+    });
+  } catch (error) {
+    console.error(
+      "/alexa-command error:",
+      error
+    );
+
+    return res.status(200).json({
+      speech:
+        "Sorry, I could not reach your device.",
+      error: error.message,
+    });
   }
 });
 
-// ---------------- Alexa direct HTTPS endpoint (no AWS Lambda needed) ----------------
+// ============================================================
+// ALEXA WEBHOOK
+// ============================================================
+
 app.post("/alexa-webhook", async (req, res) => {
-  console.log("=== /alexa-webhook HIT ===");
-  console.log("Full incoming body:", JSON.stringify(req.body, null, 2));
+  console.log("");
+  console.log("==========================================");
+  console.log("=== ALEXA WEBHOOK HIT ===");
+  console.log("==========================================");
 
-  const request = req.body.request;
+  console.log(
+    "Full incoming body:"
+  );
 
-  function speak(text, endSession = true) {
-    console.log("Replying to Alexa with:", text);
-    res.json({
+  console.log(
+    JSON.stringify(req.body, null, 2)
+  );
+
+  // ----------------------------------------------------------
+  // Alexa response helper
+  // ----------------------------------------------------------
+
+  function speak(
+    text,
+    endSession = true
+  ) {
+    console.log(
+      "Replying to Alexa:",
+      text
+    );
+
+    return res.status(200).json({
       version: "1.0",
+
       response: {
-        outputSpeech: { type: "PlainText", text },
+        outputSpeech: {
+          type: "PlainText",
+          text: String(text),
+        },
+
         shouldEndSession: endSession,
       },
     });
   }
 
-  if (!request) {
-    console.log("No 'request' field found in body!");
-    return speak("Sorry, something went wrong.");
-  }
+  try {
+    const request = req.body?.request;
 
-  console.log("Request type:", request.type);
+    // --------------------------------------------------------
+    // Invalid request
+    // --------------------------------------------------------
 
-  if (request.type === "LaunchRequest") {
-    console.log("Handling LaunchRequest");
-    return speak("Bridge skill is ready. What would you like to check?", false);
-  }
+    if (!request) {
+      console.log(
+        "No request field found"
+      );
 
-  if (request.type === "IntentRequest") {
-    const intentName = request.intent.name;
-    console.log("Handling IntentRequest:", intentName);
+      return speak(
+        "Sorry, something went wrong."
+      );
+    }
 
-    if (intentName === "CheckNotificationsIntent") {
-      console.log("Connected devices count:", connectedDevices.size);
-      if (connectedDevices.size === 0) return speak("Your device is not connected to the bridge right now.");
-      try {
-        const result = await sendCommandToDevice("check_notifications");
-        return speak(result.speech || "Done.");
-      } catch (err) {
-        console.log("Error sending command:", err.message);
-        return speak("Sorry, I could not reach your device.");
+    console.log(
+      "Alexa Request Type:",
+      request.type
+    );
+
+    // ========================================================
+    // LAUNCH REQUEST
+    // ========================================================
+
+    if (
+      request.type === "LaunchRequest"
+    ) {
+      console.log(
+        "Handling LaunchRequest"
+      );
+
+      return speak(
+        "Bridge skill is ready. What would you like to check?",
+        false
+      );
+    }
+
+    // ========================================================
+    // INTENT REQUEST
+    // ========================================================
+
+    if (
+      request.type === "IntentRequest"
+    ) {
+      const intentName =
+        request.intent?.name;
+
+      console.log(
+        "Alexa Intent:",
+        intentName
+      );
+
+      // ------------------------------------------------------
+      // CHECK NOTIFICATIONS
+      // ------------------------------------------------------
+
+      if (
+        intentName ===
+        "CheckNotificationsIntent"
+      ) {
+        console.log(
+          "CheckNotificationsIntent"
+        );
+
+        console.log(
+          "Connected devices:",
+          connectedDevices.size
+        );
+
+        if (
+          connectedDevices.size === 0
+        ) {
+          return speak(
+            "Your device is not connected to the bridge right now."
+          );
+        }
+
+        try {
+          const result =
+            await sendCommandToDevice(
+              "check_notifications"
+            );
+
+          return speak(
+            result?.speech ||
+              "You have no new notifications."
+          );
+        } catch (error) {
+          console.error(
+            "Notification command error:",
+            error.message
+          );
+
+          return speak(
+            "Sorry, I could not reach your device."
+          );
+        }
       }
-    }
 
-    if (intentName === "PingDeviceIntent") {
-      console.log("Connected devices count:", connectedDevices.size);
-      if (connectedDevices.size === 0) return speak("Your device is not connected to the bridge right now.");
-      try {
-        const result = await sendCommandToDevice("ping");
-        return speak(result.speech || "Done.");
-      } catch (err) {
-        console.log("Error sending command:", err.message);
-        return speak("Sorry, I could not reach your device.");
+      // ------------------------------------------------------
+      // PING DEVICE
+      // ------------------------------------------------------
+
+      if (
+        intentName ===
+        "PingDeviceIntent"
+      ) {
+        console.log(
+          "PingDeviceIntent"
+        );
+
+        console.log(
+          "Connected devices:",
+          connectedDevices.size
+        );
+
+        if (
+          connectedDevices.size === 0
+        ) {
+          return speak(
+            "Your device is not connected to the bridge right now."
+          );
+        }
+
+        try {
+          const result =
+            await sendCommandToDevice(
+              "ping"
+            );
+
+          return speak(
+            result?.speech ||
+              "Your device is connected and responding."
+          );
+        } catch (error) {
+          console.error(
+            "Ping command error:",
+            error.message
+          );
+
+          return speak(
+            "Sorry, I could not reach your device."
+          );
+        }
       }
+
+      // ------------------------------------------------------
+      // STOP
+      // ------------------------------------------------------
+
+      if (
+        intentName ===
+          "AMAZON.StopIntent" ||
+        intentName ===
+          "AMAZON.CancelIntent"
+      ) {
+        return speak(
+          "Okay, bye."
+        );
+      }
+
+      // ------------------------------------------------------
+      // HELP
+      // ------------------------------------------------------
+
+      if (
+        intentName ===
+        "AMAZON.HelpIntent"
+      ) {
+        return speak(
+          "You can say check my notifications, or ping my device.",
+          false
+        );
+      }
+
+      // ------------------------------------------------------
+      // FALLBACK
+      // ------------------------------------------------------
+
+      console.log(
+        "Unhandled intent:",
+        intentName
+      );
+
+      return speak(
+        "Sorry, I did not understand that."
+      );
     }
 
-    if (intentName === "AMAZON.StopIntent" || intentName === "AMAZON.CancelIntent") {
-      return speak("Okay, bye.");
+    // ========================================================
+    // SESSION ENDED
+    // ========================================================
+
+    if (
+      request.type ===
+      "SessionEndedRequest"
+    ) {
+      console.log(
+        "Alexa session ended."
+      );
+
+      return res.status(200).json({});
     }
 
-    if (intentName === "AMAZON.HelpIntent") {
-      return speak("You can say, check my notifications, or, ping my device.", false);
-    }
+    // ========================================================
+    // UNKNOWN REQUEST
+    // ========================================================
 
-    console.log("Unhandled intent:", intentName);
+    console.log(
+      "Unknown Alexa request type:",
+      request.type
+    );
+
+    return speak(
+      "Sorry, I did not understand that."
+    );
+  } catch (error) {
+    console.error(
+      "Alexa webhook error:",
+      error
+    );
+
+    return speak(
+      "Sorry, there was a problem processing your request."
+    );
   }
-
-  console.log("Falling through to default response");
-  return speak("Sorry, I did not understand that.");
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Bridge server running on port ${PORT}`));
+// ============================================================
+// 404 HANDLER
+// ============================================================
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Not Found",
+    path: req.originalUrl,
+  });
+});
+
+// ============================================================
+// GLOBAL ERROR HANDLER
+// ============================================================
+
+app.use(
+  (err, req, res, next) => {
+    console.error(
+      "Global server error:",
+      err
+    );
+
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    res.status(500).json({
+      error: "Internal Server Error",
+    });
+  }
+);
+
+// ============================================================
+// GO DADDY / PRODUCTION PORT
+// ============================================================
+
+// IMPORTANT:
+// NEVER hard-code a production port.
+//
+// GoDaddy provides PORT through:
+// process.env.PORT
+//
+// 3000 is only a local development fallback.
+
+// ============================================================
+// GO DADDY / PRODUCTION PORT
+// ============================================================
+
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = "0.0.0.0";
+
+server.listen(PORT, HOST, () => {
+  console.log("==========================================");
+  console.log(" Alexa Device Bridge Server");
+  console.log("==========================================");
+  console.log(`Server listening on ${HOST}:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log(`Connected devices: ${connectedDevices.size}`);
+  console.log("==========================================");
+});
+
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
+
+function shutdown(signal) {
+  console.log(
+    `Received ${signal}. Shutting down...`
+  );
+
+  // Clear pending command timers
+  for (const [
+    commandId,
+    pending,
+  ] of pendingCommands.entries()) {
+    clearTimeout(pending.timeout);
+
+    pending.reject(
+      new Error(
+        "Bridge server is shutting down"
+      )
+    );
+
+    pendingCommands.delete(
+      commandId
+    );
+  }
+
+  // Close Socket.IO
+  io.close(() => {
+    console.log(
+      "Socket.IO closed."
+    );
+
+    // Close HTTP server
+    server.close(() => {
+      console.log(
+        "HTTP server closed."
+      );
+
+      process.exit(0);
+    });
+  });
+
+  // Safety timeout
+  setTimeout(() => {
+    console.log(
+      "Forced shutdown."
+    );
+
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
+);
+
+// ============================================================
+// PROCESS ERROR HANDLING
+// ============================================================
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "UNCAUGHT EXCEPTION:",
+      error
+    );
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (reason) => {
+    console.error(
+      "UNHANDLED REJECTION:",
+      reason
+    );
+  }
+);
