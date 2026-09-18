@@ -13,28 +13,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Log every single incoming request, no matter the route.
+// This helps confirm whether requests (e.g. from Alexa) are even reaching this server.
+app.use((req, res, next) => {
+  console.log(`>>> Incoming request: ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // ---- Config ----
-// Set this to a secret string. Your Flutter app AND your Alexa skill
-// must both send this same key so random people can't control your devices.
 const SHARED_SECRET = process.env.BRIDGE_SECRET || "change-this-secret-123";
 
 // ---- In-memory state ----
-// connectedDevices: socket.id -> { deviceName, platform, socket }
 const connectedDevices = new Map();
-
-// pendingCommands: commandId -> { resolve, reject, timeout }
 const pendingCommands = new Map();
 
 // ---------------- Socket.io: device connections ----------------
 io.on("connection", (socket) => {
   console.log("New socket connected:", socket.id);
 
-  // Device must "register" itself right after connecting
   socket.on("register", (data) => {
-    // data = { secret, deviceName, platform }  platform: "android"|"windows"|"linux"
     if (data.secret !== SHARED_SECRET) {
       socket.emit("register_failed", { reason: "Invalid secret" });
       socket.disconnect(true);
@@ -50,9 +50,7 @@ io.on("connection", (socket) => {
     broadcastDeviceList();
   });
 
-  // Device sends back the result of a command we forwarded to it
   socket.on("command_result", (data) => {
-    // data = { commandId, result }
     const pending = pendingCommands.get(data.commandId);
     if (pending) {
       clearTimeout(pending.timeout);
@@ -76,7 +74,6 @@ function broadcastDeviceList() {
   io.emit("device_list", list);
 }
 
-// Send a command to a specific device (or the first available one) and wait for its result
 function sendCommandToDevice(commandType, payload = {}, targetDeviceName = null, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     let target = null;
@@ -113,9 +110,7 @@ app.get("/status", (req, res) => {
   });
 });
 
-// ---------------- REST: endpoint Alexa Skill's Lambda calls ----------------
-// Body: { secret, command, deviceName? }
-// command examples: "check_notifications", "battery_status", "lock_pc", "open_app"
+// ---------------- REST: endpoint for external calls (optional / legacy) ----------------
 app.post("/alexa-command", async (req, res) => {
   const { secret, command, deviceName, payload } = req.body;
 
@@ -136,12 +131,14 @@ app.post("/alexa-command", async (req, res) => {
 });
 
 // ---------------- Alexa direct HTTPS endpoint (no AWS Lambda needed) ----------------
-// In Alexa Developer Console, set Endpoint type to "HTTPS" and paste this server's
-// URL + "/alexa-webhook" here. Alexa calls this directly whenever the skill is invoked.
 app.post("/alexa-webhook", async (req, res) => {
+  console.log("=== /alexa-webhook HIT ===");
+  console.log("Full incoming body:", JSON.stringify(req.body, null, 2));
+
   const request = req.body.request;
 
   function speak(text, endSession = true) {
+    console.log("Replying to Alexa with:", text);
     res.json({
       version: "1.0",
       response: {
@@ -151,31 +148,42 @@ app.post("/alexa-webhook", async (req, res) => {
     });
   }
 
-  if (!request) return speak("Sorry, something went wrong.");
+  if (!request) {
+    console.log("No 'request' field found in body!");
+    return speak("Sorry, something went wrong.");
+  }
+
+  console.log("Request type:", request.type);
 
   if (request.type === "LaunchRequest") {
+    console.log("Handling LaunchRequest");
     return speak("Bridge skill is ready. What would you like to check?", false);
   }
 
   if (request.type === "IntentRequest") {
     const intentName = request.intent.name;
+    console.log("Handling IntentRequest:", intentName);
 
     if (intentName === "CheckNotificationsIntent") {
+      console.log("Connected devices count:", connectedDevices.size);
       if (connectedDevices.size === 0) return speak("Your device is not connected to the bridge right now.");
       try {
         const result = await sendCommandToDevice("check_notifications");
         return speak(result.speech || "Done.");
       } catch (err) {
+        console.log("Error sending command:", err.message);
         return speak("Sorry, I could not reach your device.");
       }
     }
 
     if (intentName === "PingDeviceIntent") {
+      console.log("Connected devices count:", connectedDevices.size);
       if (connectedDevices.size === 0) return speak("Your device is not connected to the bridge right now.");
       try {
         const result = await sendCommandToDevice("ping");
         return speak(result.speech || "Done.");
       } catch (err) {
+        console.log("Error sending command:", err.message);
         return speak("Sorry, I could not reach your device.");
       }
     }
@@ -187,8 +195,11 @@ app.post("/alexa-webhook", async (req, res) => {
     if (intentName === "AMAZON.HelpIntent") {
       return speak("You can say, check my notifications, or, ping my device.", false);
     }
+
+    console.log("Unhandled intent:", intentName);
   }
 
+  console.log("Falling through to default response");
   return speak("Sorry, I did not understand that.");
 });
 
