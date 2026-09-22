@@ -122,6 +122,9 @@ const HOST = "0.0.0.0";
 const SHARED_SECRET =
   process.env.BRIDGE_SECRET || "change-this-secret-123";
 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+
 // Alexa allows maximum timestamp tolerance.
 const ALEXA_TIMESTAMP_TOLERANCE_MS = 150 * 1000;
 
@@ -1597,6 +1600,108 @@ function resolveAlexaAction(request) {
   return null;
 }
 
+const DYNAMIC_ACTIONS = new Set([
+  "ping",
+  "open_app",
+  "open_url",
+  "start_music",
+  "lock_pc",
+  "shutdown_pc",
+  "restart_pc"
+]);
+
+const DYNAMIC_APPS = new Set([
+  "chrome",
+  "google chrome",
+  "vscode",
+  "vs code",
+  "visual studio code",
+  "notepad",
+  "calculator",
+  "chatgpt",
+  "youtube",
+  "youtube music",
+  "music"
+]);
+
+function validateDynamicCommand(command) {
+  if (!command || typeof command !== "object") {
+    return null;
+  }
+
+  const type = String(command.type || "").trim();
+  const payload = command.payload && typeof command.payload === "object"
+    ? command.payload
+    : {};
+
+  if (!DYNAMIC_ACTIONS.has(type)) {
+    return null;
+  }
+
+  if (type === "open_app") {
+    const app = String(payload.app || "").toLowerCase().trim();
+    return DYNAMIC_APPS.has(app)
+      ? { type, payload: { app } }
+      : null;
+  }
+
+  if (type === "open_url") {
+    const url = String(payload.url || "").trim();
+    try {
+      const parsed = new URL(url);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        return null;
+      }
+      return { type, payload: { url: parsed.toString() } };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  return { type, payload: {} };
+}
+
+async function parseDynamicCommand(naturalLanguage) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not configured on the backend");
+  }
+
+  const prompt = [
+    "You translate a user's device request into one safe JSON command.",
+    "Return JSON only, with exactly this shape: {\"type\": string, \"payload\": object}.",
+    "Allowed types: ping, open_app, open_url, start_music, lock_pc, shutdown_pc, restart_pc.",
+    "Allowed open_app values: chrome, google chrome, vscode, vs code, visual studio code, notepad, calculator, chatgpt, youtube, youtube music, music.",
+    "Use open_url only for http or https websites.",
+    "If the request is unsupported, return {\"type\":\"unsupported\",\"payload\":{}}.",
+    `User request: ${naturalLanguage}`
+  ].join("\n");
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: "application/json"
+        }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Gemini request failed (${response.status}): ${details.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const parsed = JSON.parse(text);
+  return validateDynamicCommand(parsed);
+}
+
 // ============================================================
 // ALEXA COMMAND API
 // ============================================================
@@ -2072,13 +2177,33 @@ app.post(
           intentName === "LockComputerIntent" ||
           intentName === "ShutdownComputerIntent" ||
           intentName === "RestartComputerIntent" ||
-          intentName === "OpenWebsiteIntent"
+          intentName === "OpenWebsiteIntent" ||
+          intentName === "DynamicCommandIntent"
         ) {
-          const resolvedAction = resolveAlexaAction(request);
+          let resolvedAction = resolveAlexaAction(request);
+
+          if (intentName === "DynamicCommandIntent") {
+            const commandText = getAlexaSlotValue(request, ["command"]);
+
+            try {
+              const dynamicCommand = await parseDynamicCommand(commandText);
+              resolvedAction = dynamicCommand
+                ? [dynamicCommand.type, dynamicCommand.payload]
+                : null;
+            } catch (err) {
+              errorLog("Dynamic command parsing failed", err);
+
+              return speak(
+                err.message.includes("GEMINI_API_KEY")
+                  ? "The AI command service is not configured yet. Add the Gemini API key on the backend."
+                  : "Sorry, I could not understand that command right now."
+              );
+            }
+          }
 
           if (!resolvedAction) {
             return speak(
-              "I do not recognize that action. Ask me what I can do for a list of supported actions."
+              "I cannot perform that action. Ask me what I can do for a list of supported commands."
             );
           }
 
