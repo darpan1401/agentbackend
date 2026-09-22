@@ -72,7 +72,7 @@ server.on('request', (req, res) => {
 // environments where websocket upgrades may be restricted. Tweak timeouts
 // to be reasonable for free-tier hosts.
 const io = new Server(server, {
-  path: '/socket.io',
+  path: '/socket.io/',
   cors: {
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"]
@@ -1508,6 +1508,93 @@ function sendCommandToDevice(
   );
 }
 
+// Keep Alexa's public vocabulary aligned with the Flutter command router.
+const ALEXA_CAPABILITIES = [
+  "check whether the device is online",
+  "open Chrome",
+  "open Visual Studio Code",
+  "open ChatGPT",
+  "open YouTube Music",
+  "open a supported app such as Notepad or Calculator",
+  "open a website by URL",
+  "lock the Windows computer",
+  "shut down the Windows computer",
+  "restart the Windows computer"
+];
+
+function getAlexaSlotValue(request, names) {
+  for (const name of names) {
+    const value = request.intent?.slots?.[name]?.value;
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function resolveAlexaAction(request) {
+  const intentName = request.intent?.name || "";
+  const action = getAlexaSlotValue(request, ["action", "command", "task"])
+    .toLowerCase()
+    .trim();
+
+  const directIntentCommands = {
+    OpenChromeIntent: ["open_app", { app: "chrome" }],
+    OpenVSCodeIntent: ["open_app", { app: "vscode" }],
+    OpenChatGPTIntent: ["open_chatgpt", {}],
+    StartMusicIntent: ["start_music", {}],
+    LockComputerIntent: ["lock_pc", {}],
+    ShutdownComputerIntent: ["shutdown_pc", {}],
+    RestartComputerIntent: ["restart_pc", {}],
+    OpenWebsiteIntent: ["open_url", {
+      url: getAlexaSlotValue(request, ["url", "website"])
+    }]
+  };
+
+  if (directIntentCommands[intentName]) {
+    return directIntentCommands[intentName];
+  }
+
+  if (!action) {
+    return null;
+  }
+
+  if (action.includes("chrome")) {
+    return ["open_app", { app: "chrome" }];
+  }
+  if (action.includes("vscode") || action.includes("vs code") || action.includes("visual studio code")) {
+    return ["open_app", { app: "vscode" }];
+  }
+  if (action.includes("chatgpt")) {
+    return ["open_chatgpt", {}];
+  }
+  if (action.includes("music") || action.includes("youtube")) {
+    return ["start_music", {}];
+  }
+  if (action.includes("notepad")) {
+    return ["open_app", { app: "notepad" }];
+  }
+  if (action.includes("calculator")) {
+    return ["open_app", { app: "calculator" }];
+  }
+  if (action.includes("lock")) {
+    return ["lock_pc", {}];
+  }
+  if (action.includes("shut down") || action.includes("shutdown")) {
+    return ["shutdown_pc", {}];
+  }
+  if (action.includes("restart") || action.includes("reboot")) {
+    return ["restart_pc", {}];
+  }
+
+  const url = getAlexaSlotValue(request, ["url", "website"]);
+  if (url) {
+    return ["open_url", { url }];
+  }
+
+  return null;
+}
+
 // ============================================================
 // ALEXA COMMAND API
 // ============================================================
@@ -1946,6 +2033,74 @@ app.post(
         console.log(
           "****************************************************"
         );
+
+        // ====================================================
+        // LIST CAPABILITIES
+        // ====================================================
+
+        if (
+          intentName ===
+          "ListCapabilitiesIntent"
+        ) {
+          const connectionState = connectedDevices.size
+            ? "Your device is connected."
+            : "No device is connected right now."
+          ;
+
+          return speak(
+            `${connectionState} I can ${ALEXA_CAPABILITIES.join(", ")}.`,
+            false
+          );
+        }
+
+        // ====================================================
+        // DEVICE ACTION
+        // ====================================================
+
+        if (
+          intentName ===
+          "DeviceActionIntent" ||
+          intentName === "AlexaActionIntent" ||
+          intentName === "OpenChromeIntent" ||
+          intentName === "OpenVSCodeIntent" ||
+          intentName === "OpenChatGPTIntent" ||
+          intentName === "StartMusicIntent" ||
+          intentName === "LockComputerIntent" ||
+          intentName === "ShutdownComputerIntent" ||
+          intentName === "RestartComputerIntent" ||
+          intentName === "OpenWebsiteIntent"
+        ) {
+          const resolvedAction = resolveAlexaAction(request);
+
+          if (!resolvedAction) {
+            return speak(
+              "I do not recognize that action. Ask me what I can do for a list of supported actions."
+            );
+          }
+
+          if (connectedDevices.size === 0) {
+            return speak(
+              "Your device is not connected to the bridge right now."
+            );
+          }
+
+          try {
+            const result = await sendCommandToDevice(
+              resolvedAction[0],
+              resolvedAction[1]
+            );
+
+            return speak(
+              result?.speech || "Done."
+            );
+          } catch (err) {
+            errorLog("Device action failed", err);
+
+            return speak(
+              "Sorry, I could not reach your device."
+            );
+          }
+        }
 
         // ====================================================
         // CHECK NOTIFICATIONS
