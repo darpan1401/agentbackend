@@ -1668,6 +1668,8 @@ async function parseDynamicCommand(naturalLanguage) {
 
   const prompt = [
     "You translate a user's device request into one safe JSON command.",
+    "Understand English, Hindi, Hinglish, and natural variations such as kholo, khol do, chalao, chala do, band karo, lock karo, restart karo, and computer par karo.",
+    "Ignore politeness words and translate the user's actual requested action.",
     "Return JSON only, with exactly this shape: {\"type\": string, \"payload\": object}.",
     "Allowed types: ping, open_app, open_url, start_music, lock_pc, shutdown_pc, restart_pc.",
     "Allowed open_app values: chrome, google chrome, vscode, vs code, visual studio code, notepad, calculator, chatgpt, youtube, youtube music, music.",
