@@ -1535,6 +1535,46 @@ function getAlexaSlotValue(request, names) {
   return "";
 }
 
+function normalizeDeviceName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function getConnectedDeviceNames() {
+  return Array.from(connectedDevices.values())
+    .map((device) => device.deviceName);
+}
+
+function resolveTargetDevice(targetDeviceName) {
+  const devices = Array.from(connectedDevices.values());
+
+  if (devices.length === 1 && !targetDeviceName) {
+    return { device: devices[0], reason: "single" };
+  }
+
+  if (!targetDeviceName) {
+    return { device: null, reason: "required", devices };
+  }
+
+  const requested = normalizeDeviceName(targetDeviceName);
+  const matches = devices.filter((device) => {
+    const name = normalizeDeviceName(device.deviceName);
+    return name === requested || name.includes(requested) || requested.includes(name);
+  });
+
+  if (matches.length === 1) {
+    return { device: matches[0], reason: "matched" };
+  }
+
+  return {
+    device: null,
+    reason: matches.length > 1 ? "ambiguous" : "not_found",
+    devices: matches.length > 1 ? matches : devices
+  };
+}
+
 function resolveAlexaAction(request) {
   const intentName = request.intent?.name || "";
   const action = getAlexaSlotValue(request, ["action", "command", "task"])
@@ -1959,7 +1999,8 @@ app.post(
 
     function speak(
       text,
-      endSession = true
+      endSession = true,
+      sessionAttributes = undefined
     ) {
 
       console.log("");
@@ -1979,9 +2020,7 @@ app.post(
 
       console.log("");
 
-      return res
-        .status(200)
-        .json({
+      const response = {
           version: "1.0",
 
           response: {
@@ -1995,10 +2034,15 @@ app.post(
                 String(text)
             },
 
-            shouldEndSession:
-              endSession
+            shouldEndSession: endSession
           }
-        });
+      };
+
+      if (sessionAttributes) {
+        response.sessionAttributes = sessionAttributes;
+      }
+
+      return res.status(200).json(response);
     }
 
     try {
@@ -2143,6 +2187,37 @@ app.post(
           "****************************************************"
         );
 
+        const sessionAttributes = request.session?.attributes || {};
+        const selectedDeviceName = getAlexaSlotValue(request, ["targetDevice", "device"]);
+
+        if (
+          sessionAttributes.pendingCommandType &&
+          selectedDeviceName
+        ) {
+          const targetSelection = resolveTargetDevice(selectedDeviceName);
+
+          if (!targetSelection.device) {
+            return speak(
+              `I could not find that device. Connected devices are ${getConnectedDeviceNames().join(", ")}.`,
+              false,
+              sessionAttributes
+            );
+          }
+
+          try {
+            const result = await sendCommandToDevice(
+              sessionAttributes.pendingCommandType,
+              sessionAttributes.pendingCommandPayload || {},
+              targetSelection.device.deviceName
+            );
+
+            return speak(result?.speech || "Done.");
+          } catch (err) {
+            errorLog("Pending device action failed", err);
+            return speak("Sorry, I could not reach your device.");
+          }
+        }
+
         // ====================================================
         // LIST CAPABILITIES
         // ====================================================
@@ -2215,10 +2290,32 @@ app.post(
             );
           }
 
+          const targetDeviceName = getAlexaSlotValue(request, ["targetDevice", "device"]);
+          const targetSelection = resolveTargetDevice(targetDeviceName);
+
+          if (!targetSelection.device) {
+            if (targetSelection.reason === "required") {
+              return speak(
+                `Which device should I use? You have ${getConnectedDeviceNames().join(", ")}.`,
+                false,
+                {
+                  pendingCommandType: resolvedAction[0],
+                  pendingCommandPayload: resolvedAction[1]
+                }
+              );
+            }
+
+            return speak(
+              `I could not find that device. Connected devices are ${getConnectedDeviceNames().join(", ")}.`,
+              false
+            );
+          }
+
           try {
             const result = await sendCommandToDevice(
               resolvedAction[0],
-              resolvedAction[1]
+              resolvedAction[1],
+              targetSelection.device.deviceName
             );
 
             return speak(
@@ -2256,11 +2353,28 @@ app.post(
             );
           }
 
+          const targetDeviceName = getAlexaSlotValue(request, ["targetDevice", "device"]);
+          const targetSelection = resolveTargetDevice(targetDeviceName);
+
+          if (!targetSelection.device) {
+            return speak(
+              targetSelection.reason === "required"
+                ? `Which device should I use? You have ${getConnectedDeviceNames().join(", ")}.`
+                : `I could not find that device. Connected devices are ${getConnectedDeviceNames().join(", ")}.`,
+              targetSelection.reason === "required",
+              targetSelection.reason === "required"
+                ? { pendingCommandType: "check_notifications", pendingCommandPayload: {} }
+                : undefined
+            );
+          }
+
           try {
 
             const result =
               await sendCommandToDevice(
-                "check_notifications"
+                "check_notifications",
+                {},
+                targetSelection.device.deviceName
               );
 
             return speak(
@@ -2304,11 +2418,28 @@ app.post(
             );
           }
 
+          const targetDeviceName = getAlexaSlotValue(request, ["targetDevice", "device"]);
+          const targetSelection = resolveTargetDevice(targetDeviceName);
+
+          if (!targetSelection.device) {
+            return speak(
+              targetSelection.reason === "required"
+                ? `Which device should I use? You have ${getConnectedDeviceNames().join(", ")}.`
+                : `I could not find that device. Connected devices are ${getConnectedDeviceNames().join(", ")}.`,
+              targetSelection.reason === "required",
+              targetSelection.reason === "required"
+                ? { pendingCommandType: "ping", pendingCommandPayload: {} }
+                : undefined
+            );
+          }
+
           try {
 
             const result =
               await sendCommandToDevice(
-                "ping"
+                "ping",
+                {},
+                targetSelection.device.deviceName
               );
 
             return speak(
