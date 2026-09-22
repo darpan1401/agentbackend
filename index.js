@@ -1543,6 +1543,8 @@ function resolveAlexaAction(request) {
     OpenVSCodeIntent: ["open_app", { app: "vscode" }],
     OpenChatGPTIntent: ["open_chatgpt", {}],
     StartMusicIntent: ["start_music", {}],
+    OpenNotepadIntent: ["open_app", { app: "notepad" }],
+    OpenCalculatorIntent: ["open_app", { app: "calculator" }],
     LockComputerIntent: ["lock_pc", {}],
     ShutdownComputerIntent: ["shutdown_pc", {}],
     RestartComputerIntent: ["restart_pc", {}],
@@ -2003,7 +2005,7 @@ app.post(
         );
 
         return speak(
-          "Bridge skill is ready. What would you like to check?",
+          "My Liza is ready. What would you like me to do?",
           false
         );
       }
@@ -2065,6 +2067,8 @@ app.post(
           intentName === "OpenVSCodeIntent" ||
           intentName === "OpenChatGPTIntent" ||
           intentName === "StartMusicIntent" ||
+          intentName === "OpenNotepadIntent" ||
+          intentName === "OpenCalculatorIntent" ||
           intentName === "LockComputerIntent" ||
           intentName === "ShutdownComputerIntent" ||
           intentName === "RestartComputerIntent" ||
